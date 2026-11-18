@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Intervjuare uses the selected microphone to transcribe the candidate locally.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Intervjuare captures audio only from the selected meeting application for local transcription.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Intervjuare captures audio only from the selected meeting application for local transcription.</string>
+</dict>
+</plist>

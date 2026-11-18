@@ -1,0 +1,36 @@
+{
+  "name": "intervjuare",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "bundle:debug": "INTERVJUARE_STABLE_PERMISSION_BUILD=1 npm run tauri -- build --debug && node scripts/sign-macos-bundle.mjs src-tauri/target/debug/bundle/macos/Intervjuare.app",
+    "bundle:stable": "INTERVJUARE_STABLE_PERMISSION_BUILD=1 npm run tauri -- build --debug && node scripts/sign-macos-bundle.mjs src-tauri/target/debug/bundle/macos/Intervjuare.app",
+    "bundle:adhoc-developer-only": "INTERVJUARE_ALLOW_ADHOC_DEVELOPER_BUILD=1 npm run tauri -- build --debug && node scripts/sign-macos-bundle.mjs src-tauri/target/debug/bundle/macos/Intervjuare.app --allow-adhoc-developer-only",
+    "bundle:verify": "node scripts/verify-macos-bundle.mjs src-tauri/target/debug/bundle/macos/Intervjuare.app",
+    "test:signing": "node --test scripts/codesign-config.test.mjs scripts/stable-permission-build.test.mjs scripts/passive-refresh.test.mjs scripts/verify-bundle-logic.test.mjs",
+    "test:trial-model": "node --test scripts/verify-trial-bundle-model.test.mjs",
+    "test": "node --experimental-strip-types --test src/*.test.ts",
+    "lint": "oxlint src",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "2.11.1",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0"
+  }
+}

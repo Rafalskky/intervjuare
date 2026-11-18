@@ -1,7 +1,7 @@
 # Example candidate profile for Intervjuare.
 #
 # Copy to `profile.yaml` (ignored by Git) and replace everything with your own
-# real experience. Hermes may only make personal claims that are grounded in
+# real experience. The model may only make personal claims that are grounded in
 # this file, so write down what actually happened, not what sounds good.
 #
 # Keys under `projects` and `stories` are ids. Suggestions cite them, and the

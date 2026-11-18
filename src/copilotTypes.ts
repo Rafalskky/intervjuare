@@ -1,7 +1,8 @@
-// Mirrors the camelCase Serialize types in src-tauri/src/{copilot,profile,context,hermes}.rs.
+// Mirrors the camelCase Serialize types in src-tauri/src/{copilot,profile,context,settings,codex_auth,llm}.rs.
 
 export type Speaker = 'candidate' | 'interviewer'
 export type InterviewLanguage = 'sv' | 'en'
+export type AnswerMode = 'normal' | 'short' | 'star' | 'technical' | 'simple' | 'explain'
 
 export type SuggestionStatus = 'preparing' | 'streaming' | 'done' | 'skipped' | 'cancelled' | 'failed'
 
@@ -24,6 +25,10 @@ export type SuggestionEvent = {
   noVerifiedExample: boolean
   error: string | null
   forced: boolean
+  mode: AnswerMode
+  alternative: boolean
+  screen: boolean
+  model: string
   timing: SuggestionTiming
 }
 
@@ -44,27 +49,45 @@ export type JobContext = {
   language: InterviewLanguage
 }
 
-export type HermesConfigSummary = {
-  baseUrl: string
-  keyConfigured: boolean
-  keySource: string
+export type Settings = {
+  accountEmail: string | null
   model: string
-  apiServerEnabled: boolean | null
+  reasoningEffort: string
+  screenModel: string
+  profilePath: string | null
+  job: JobContext
+  autoAnswer: boolean
+  answerMode: AnswerMode
 }
 
-export type HermesStatus = {
-  reachable: boolean
-  authorized: boolean
-  message: string
-  latencyMs: number
-  config: HermesConfigSummary
+export type AccountSummary = {
+  email: string
+  plan: string | null
+  source: string
+  expiresAtMs: number
+  expired: boolean
 }
+
+export type ModelInfo = { slug: string; description: string }
+
+export type ConnectionStatus = {
+  ok: boolean
+  message: string
+  account: AccountSummary | null
+  models: ModelInfo[]
+  latencyMs: number
+}
+
+export type MemoryEvent = { text: string; absorbedTurns: number; error: string | null }
 
 export type CopilotStatus = {
   profile: ProfileSummary | null
   profileError: string | null
   profilePath: string
-  job: JobContext
-  autoAnswer: boolean
-  hermes: HermesConfigSummary
+  settings: Settings
+  settingsWarning: string | null
+  accounts: AccountSummary[]
+  memory: string
+  memoryTurns: number
+  storiesUsed: string[]
 }

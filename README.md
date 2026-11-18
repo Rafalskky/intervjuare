@@ -37,7 +37,7 @@ Live transcription
         ↓
 Conversation context
         ↓
-Hermes understands what is happening
+The model understands what is happening
         ↓
 Relevant candidate experience is selected
         ↓
@@ -140,7 +140,7 @@ important_topics:
 language: sv
 ```
 
-This information does not modify `profile.yaml`. It changes how Hermes interprets and prioritizes the candidate's existing experience.
+This information does not modify `profile.yaml`. It changes how the model interprets and prioritizes the candidate's existing experience.
 
 Example:
 
@@ -314,7 +314,7 @@ Recommended high-level architecture:
 │ transcript buffering                    │
 │ context management                      │
 │ storage                                 │
-│ Hermes communication                    │
+│ model communication                     │
 │ event handling                          │
 └─────────────┬───────────────┬───────────┘
               │               │
@@ -350,30 +350,26 @@ Candidate profile
 YAML
 
 Runtime AI
-Hermes
+ChatGPT subscription (existing Codex sign-in)
 ```
 
 ---
 
-## Hermes as the AI Runtime
+## AI Runtime: ChatGPT Subscription
 
-Intervjuare should use **Hermes** as the runtime AI layer.
-
-The application should not require direct paid model API usage as its primary design.
-
-The intended model is:
+Intervjuare calls the language model directly. No separate agent runtime (such as Hermes) is required. *(Owner decision, 2026-11-18: Hermes was the original plan and has been removed.)*
 
 ```text
 Intervjuare
      ↓
-Hermes
+chatgpt.com/backend-api/codex   (Responses API, streaming)
      ↓
-configured language model provider
-     ↓
-candidate's existing subscription quota
+the owner's existing ChatGPT subscription
 ```
 
-Hermes is responsible for the AI-heavy parts of the system, including understanding the current interview situation, understanding what the interviewer is asking, choosing the best candidate experience, deciding how to frame that experience, creating speaking anchors, writing the full answer, understanding screenshots, using web information when needed, understanding technical questions, maintaining interview memory, and predicting likely follow-up questions.
+Authentication reuses the ChatGPT sign-in that already exists on the Mac: the Codex app / `codex login` (`~/.codex/auth.json`), with a Hermes-stored copy (`~/.hermes/auth.json`) read only as a fallback. The owner chooses which account e-mail is used. The app never falls back to another account, never refreshes or rewrites those tokens (that would sign the owning tool out) and re-reads them for every request. The default model is `gpt-6-luna` with reasoning `none`, the fastest measured option. See `docs/model-runtime.md`.
+
+The model is responsible for the AI-heavy parts of the system, including understanding the current interview situation, understanding what the interviewer is asking, choosing the best candidate experience, deciding how to frame that experience, creating speaking anchors, writing the full answer, understanding screenshots, using web information when needed, understanding technical questions, maintaining interview memory, and predicting likely follow-up questions.
 
 Intervjuare itself should remain primarily an orchestration layer.
 
@@ -397,10 +393,10 @@ local storage
 screen capture
 window management
 interview state
-sending context to Hermes
+sending context to the model
 ```
 
-The actual semantic understanding belongs to Hermes.
+The actual semantic understanding belongs to the model.
 
 ---
 
@@ -481,7 +477,7 @@ Swedish
 English
 ```
 
-The candidate profile does not need to be duplicated in both languages. Hermes should answer in the current interview language.
+The candidate profile does not need to be duplicated in both languages. The model should answer in the current interview language.
 
 ```text
 Swedish interviewer
@@ -535,7 +531,7 @@ interview_state:
     - built password reset protection
 ```
 
-This allows Hermes to avoid repeating the same example, contradicting an earlier answer, forgetting what was already discussed, or missing references such as `och hur gjorde du då?`.
+This allows the model to avoid repeating the same example, contradicting an earlier answer, forgetting what was already discussed, or missing references such as `och hur gjorde du då?`.
 
 ---
 
@@ -564,7 +560,7 @@ The system should preserve speaker identity.
 
 The entire raw transcript should not need to be resent indefinitely.
 
-Instead, Hermes can maintain a compact interview memory.
+Instead, the model can maintain a compact interview memory.
 
 ```yaml
 interview_memory:
@@ -596,7 +592,7 @@ depending on the interview.
 
 ---
 
-## Context Sent to Hermes
+## Context Sent to the Model
 
 Conceptually:
 
@@ -619,10 +615,10 @@ Conceptually:
 │ TASK                        │
 └─────────────────────────────┘
               ↓
-            HERMES
+            MODEL
 ```
 
-For the initial implementation, passing the complete `profile.yaml` to Hermes is acceptable.
+For the initial implementation, passing the complete `profile.yaml` to the model is acceptable.
 
 There is no requirement to build a vector database, embedding infrastructure, local semantic search, or a complex retrieval pipeline unless the profile eventually becomes too large.
 
@@ -648,7 +644,7 @@ Examples:
 "Jag skulle gärna vilja höra lite mer om din roll i projektet."
 ```
 
-Hermes should understand the conversational intent.
+The model should understand the conversational intent.
 
 ---
 
@@ -659,16 +655,16 @@ There should not be a separate expensive AI request just to classify the questio
 Avoid:
 
 ```text
-Hermes request #1
+Model request #1
 → classify question
 
 wait
 
-Hermes request #2
+Model request #2
 → answer question
 ```
 
-Prefer one Hermes generation with instructions to understand the interview context, determine what the interviewer wants, choose the most relevant experience, immediately provide speaking anchors, and continue with the full answer.
+Prefer one model generation with instructions to understand the interview context, determine what the interviewer wants, choose the most relevant experience, immediately provide speaking anchors, and continue with the full answer.
 
 ---
 
@@ -678,7 +674,7 @@ This is one of the most important features.
 
 The candidate should not have to wait for a complete polished response.
 
-Hermes should produce output in this order:
+The model should produce output in this order:
 
 ```text
 1. SPEAKING ANCHORS
@@ -731,7 +727,7 @@ Interviewer finishes
         │
         ├── detect end of turn
         ├── build context package
-        ├── send to Hermes
+        ├── send to the model
         ├── first anchors arrive
         └── full answer begins streaming
 ```
@@ -770,7 +766,7 @@ Example:
 "Kan du berätta om ett tillfälle där du själv..."
 ```
 
-Hermes could already infer that the question may involve ownership, initiative, or a behavioral example.
+The model could already infer that the question may involve ownership, initiative, or a behavioral example.
 
 When the interviewer continues:
 
@@ -884,7 +880,7 @@ This is especially important for candidates interviewing in a non-native languag
 
 Not all interview questions concern personal experience.
 
-Hermes should understand the difference between:
+The model should understand the difference between:
 
 ```text
 PERSONAL
@@ -901,7 +897,7 @@ Example:
 "What is SSR?"
 ```
 
-does not require a personal story. Hermes may answer from its technical knowledge.
+does not require a personal story. The model may answer from its technical knowledge.
 
 Example:
 
@@ -917,7 +913,7 @@ does require grounding in `profile.yaml`.
 
 ### Technical knowledge
 
-Hermes may use general model knowledge for questions such as:
+The model may use general model knowledge for questions such as:
 
 ```text
 What is SSR?
@@ -950,7 +946,7 @@ The application may still help formulate an honest answer.
 
 ## Internet Access
 
-Hermes may use the internet when useful.
+The model may use the internet when useful.
 
 However, web search should not be part of every response.
 
@@ -981,7 +977,7 @@ question
    │
    └── current information needed
            ↓
-       Hermes uses web
+       model uses web
            ↓
        response updated
 ```
@@ -1028,9 +1024,9 @@ Intervjuare recognizes explicit command
         ↓
 captures relevant screen context
         ↓
-sends screen context + interview context to Hermes
+sends screen context + interview context to the model
         ↓
-Hermes helps interpret what is shown
+the model helps interpret what is shown
 ```
 
 This command should be detected locally. The command itself should not become normal interview context.
@@ -1083,13 +1079,13 @@ Example:
 
 The later questions should not be interpreted as independent questions with no context.
 
-Hermes should understand what references such as `det`, `den lösningen`, `då`, `projektet`, and `problemet` refer to.
+The model should understand what references such as `det`, `den lösningen`, `då`, `projektet`, and `problemet` refer to.
 
 ---
 
 ## Follow-Up Prediction
 
-While the candidate is answering, Hermes may prepare likely follow-up areas.
+While the candidate is answering, the model may prepare likely follow-up areas.
 
 Example:
 
@@ -1264,7 +1260,7 @@ Choose interview language or automatic detection
 Select microphone
 Select interview audio source
 Test transcription
-Confirm Hermes connection
+Confirm ChatGPT connection
 Start interview
 ```
 
@@ -1357,7 +1353,7 @@ src-tauri/
     transcription/
     interview/
     context/
-    hermes/
+    llm/
     storage/
     commands/
     events/
@@ -1379,7 +1375,7 @@ packages/
 docs/
   architecture.md
   audio-pipeline.md
-  hermes.md
+  model-runtime.md
   context-management.md
   profile-format.md
   latency.md
@@ -1415,9 +1411,9 @@ cp profile.example.yaml profile.yaml
 INTERVJUARE_CODESIGN_IDENTITY="<identity from: security find-identity -v -p codesigning>" npm run bundle:stable
 ```
 
-See `docs/audio-pipeline.md` ("Stable permissions across rebuilds") for signing details, `docs/hermes.md` for enabling the Hermes API server, `docs/profile-format.md` for the profile, and `docs/context-management.md` for how interview turns trigger suggestions.
+See `docs/audio-pipeline.md` ("Stable permissions across rebuilds") for signing details, `docs/model-runtime.md` for choosing the ChatGPT account and model, `docs/profile-format.md` for the profile, and `docs/context-management.md` for how interview turns trigger suggestions.
 
-Without audio, the copilot can be tried with **Test without audio**: typed interviewer/candidate turns take the same conversation and Hermes path as transcribed speech.
+Without audio, the copilot can be tried with **Test without audio**: typed interviewer/candidate turns take the same conversation and model path as transcribed speech.
 
 ---
 
@@ -1536,9 +1532,9 @@ profile loading
 
 Still no complex AI logic required locally.
 
-### Phase 3 — Hermes Integration
+### Phase 3 — Model Integration
 
-Connect Intervjuare to Hermes.
+Connect Intervjuare to the model (ChatGPT subscription).
 
 First test:
 
@@ -1551,7 +1547,7 @@ recent conversation
 +
 current interviewer turn
         ↓
-Hermes
+The model
         ↓
 structured response
 ```
@@ -1587,7 +1583,7 @@ full answer begins < 2 seconds
 
 Add compact long-term interview memory.
 
-Hermes periodically updates:
+The model periodically updates:
 
 ```text
 topics discussed
@@ -1601,7 +1597,7 @@ Recent transcript remains separate.
 
 ### Phase 6 — Job-Aware Answering
 
-Make sure Hermes properly adapts the same experience to different roles.
+Make sure the model properly adapts the same experience to different roles.
 
 Test:
 
@@ -1621,7 +1617,7 @@ Implement:
 "Låt oss se"
 "Let's see"
 screen capture
-screen context → Hermes
+screen context → model
 screen-aware answer
 ```
 
@@ -1629,7 +1625,7 @@ Then optionally add automatic recognition of visually dependent questions.
 
 ### Phase 8 — Internet Access
 
-Allow Hermes to use current external information when necessary.
+Allow the model to use current external information when necessary.
 
 Do not make web access the default path for every answer. Test latency carefully.
 
@@ -1674,14 +1670,14 @@ The first genuinely useful version should support:
 6. load profile.yaml
 7. accept job context
 8. maintain recent interview context
-9. send complete relevant context to Hermes
+9. send complete relevant context to the model
 10. automatically understand when interviewer expects an answer
 11. show fast speaking anchors
 12. stream a full answer underneath
 13. avoid inventing candidate experience
 14. use different angles depending on the role
 15. support "Låt oss se"
-16. analyse screenshots through Hermes
+16. analyse screenshots through the model
 17. preserve interview memory
 18. optionally use internet information when needed
 19. remain a private personal macOS tool
@@ -1744,7 +1740,7 @@ Do not proceed until this works well.
 
 ### Milestone 2
 
-Add Hermes.
+Add the model.
 
 Input:
 
@@ -1792,7 +1788,7 @@ Add:
 ↓
 screenshot
 ↓
-Hermes vision context
+vision context
 ↓
 answer
 ```
@@ -1834,7 +1830,7 @@ Candidate profile contains:
 password_reset_race_condition
 ```
 
-Hermes receives:
+The model receives:
 
 ```text
 job context

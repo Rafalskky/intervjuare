@@ -1,24 +1,42 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { CopilotStatus, HermesStatus, InterviewLanguage, JobContext, Speaker, SuggestionEvent } from './copilotTypes'
+import type {
+  AnswerMode,
+  ConnectionStatus,
+  CopilotStatus,
+  InterviewLanguage,
+  JobContext,
+  MemoryEvent,
+  Speaker,
+  SuggestionEvent,
+} from './copilotTypes'
 import { applySuggestionEvent, EMPTY_SUGGESTION_VIEW, type SuggestionView } from './suggestionView'
 
 export type CopilotApi = ReturnType<typeof useCopilot>
+
+export type ModelSettingsInput = {
+  accountEmail: string | null
+  model: string
+  reasoningEffort: string
+  screenModel: string
+}
 
 /** Copilot state shared by the setup panel and the suggestion panel. All
  * reasoning and state live in Rust; this hook only mirrors and invokes. */
 export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, language: InterviewLanguage) {
   const [status, setStatus] = useState<CopilotStatus | null>(null)
   const [view, setView] = useState<SuggestionView>(EMPTY_SUGGESTION_VIEW)
-  const [hermes, setHermes] = useState<HermesStatus | null>(null)
-  const [checkingHermes, setCheckingHermes] = useState(false)
+  const [connection, setConnection] = useState<ConnectionStatus | null>(null)
+  const [checking, setChecking] = useState(false)
+  const [memory, setMemory] = useState<MemoryEvent | null>(null)
+  const [commandSegments, setCommandSegments] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   const jobRef = useRef<JobContext | null>(null)
 
   const refreshStatus = useCallback(async () => {
     const next = await invoke<CopilotStatus>('copilot_status')
-    jobRef.current = next.job
+    jobRef.current = next.settings.job
     setStatus(next)
     return next
   }, [])
@@ -33,34 +51,35 @@ export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, languag
     }
   }, [])
 
-  const checkHermes = useCallback(async () => {
-    setCheckingHermes(true)
-    await run(async () => setHermes(await invoke<HermesStatus>('check_hermes')))
-    setCheckingHermes(false)
+  const checkConnection = useCallback(async () => {
+    setChecking(true)
+    await run(async () => setConnection(await invoke<ConnectionStatus>('check_connection')))
+    setChecking(false)
   }, [run])
 
   useEffect(() => {
     if (!nativeBackendAvailable) return
     let active = true
-    let unlisten: (() => void) | undefined
+    const stops: Array<() => void> = []
+    const keep = (stop: () => void) => (active ? stops.push(stop) : stop())
     listen<SuggestionEvent>('suggestion-event', ({ payload }) => {
       if (active) setView((current) => applySuggestionEvent(current, payload))
-    })
-      .then((stop) => {
-        if (active) unlisten = stop
-        else stop()
-      })
-      .catch((cause) => active && setError(String(cause)))
+    }).then(keep).catch((cause) => active && setError(String(cause)))
+    listen<MemoryEvent>('memory-event', ({ payload }) => {
+      if (active) setMemory(payload)
+    }).then(keep).catch((cause) => active && setError(String(cause)))
+    listen<{ segmentId: string }>('voice-command', ({ payload }) => {
+      if (active) setCommandSegments((current) => [...current, payload.segmentId])
+    }).then(keep).catch((cause) => active && setError(String(cause)))
     queueMicrotask(() => {
       if (!active) return
-      void run(refreshStatus)
-      void checkHermes()
+      void run(refreshStatus).then(() => void checkConnection())
     })
     return () => {
       active = false
-      unlisten?.()
+      stops.forEach((stop) => stop())
     }
-  }, [nativeBackendAvailable, refreshStatus, run, checkHermes])
+  }, [nativeBackendAvailable, refreshStatus, run, checkConnection])
 
   const applyJob = useCallback(
     async (job: JobContext) => {
@@ -72,7 +91,7 @@ export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, languag
     [run, refreshStatus],
   )
 
-  // The interview language is chosen once (audio setup) and shared with Hermes.
+  // The interview language is chosen once (audio setup) and shared with the model.
   useEffect(() => {
     const job = jobRef.current
     if (!nativeBackendAvailable || !job || job.language === language) return
@@ -82,30 +101,48 @@ export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, languag
   return {
     status,
     view,
-    hermes,
-    checkingHermes,
+    connection,
+    checking,
+    memory,
+    commandSegments,
     error,
-    checkHermes,
+    checkConnection,
     applyJob,
     reloadProfile: (path: string) =>
       run(async () => {
-        await invoke('load_candidate_profile', { path: path.trim() || null }).catch(async (cause) => {
+        try {
+          await invoke('load_candidate_profile', { path: path.trim() || null })
+        } finally {
           await refreshStatus()
-          throw cause
-        })
+        }
+      }),
+    saveModelSettings: (input: ModelSettingsInput) =>
+      run(async () => {
+        await invoke('set_model_settings', input)
         await refreshStatus()
+        await checkConnection()
       }),
     setAutoAnswer: (enabled: boolean) =>
       run(async () => {
         await invoke('set_auto_answer', { enabled })
         await refreshStatus()
       }),
-    forceAnswer: () => run(() => invoke<number>('force_answer')),
+    setAnswerMode: (mode: AnswerMode) =>
+      run(async () => {
+        await invoke('set_answer_mode', { mode })
+        await refreshStatus()
+      }),
+    forceAnswer: (mode?: AnswerMode, alternative = false) =>
+      run(() => invoke<number>('force_answer', { mode: mode ?? null, alternative })),
+    captureScreen: (applicationId: string) =>
+      run(() => invoke<number>('capture_screen_answer', { applicationId: applicationId || null })),
     cancelSuggestion: () => run(() => invoke('cancel_suggestion')),
     clearConversation: () =>
       run(async () => {
         await invoke('clear_conversation')
         setView(EMPTY_SUGGESTION_VIEW)
+        setMemory(null)
+        setCommandSegments([])
       }),
     submitTestTurn: (speaker: Speaker, text: string) =>
       run(() => invoke<TTranscript>('submit_test_turn', { speaker, text })),

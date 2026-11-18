@@ -1,4 +1,4 @@
-import type { Speaker, SuggestionEvent, SuggestionTiming } from './copilotTypes.ts'
+import type { AnswerMode, ModelInfo, Speaker, SuggestionEvent, SuggestionTiming } from './copilotTypes.ts'
 
 /** What the suggestion panel shows. `fallback` is the last suggestion with
  * visible content; it comes back when a newer turn turns out to need no
@@ -23,7 +23,7 @@ export function applySuggestionEvent(view: SuggestionView, event: SuggestionEven
   const fallback = isNew && shown && hasContent(shown) ? shown : view.fallback
 
   if (event.status === 'skipped') {
-    return { shown: fallback, fallback, notice: 'Hermes: the last interviewer turn did not need an answer.' }
+    return { shown: fallback, fallback, notice: 'The last interviewer turn did not need an answer.' }
   }
   if (event.status === 'cancelled' && !hasContent(event)) {
     return { shown: fallback, fallback, notice: 'The interviewer kept talking — waiting for the full question.' }
@@ -67,4 +67,23 @@ export function parseTopics(input: string): string[] {
     .split(/[,\n]/)
     .map((topic) => topic.trim())
     .filter((topic) => topic.length > 0)
+}
+
+export const ANSWER_MODE_LABELS: Record<AnswerMode, string> = {
+  normal: 'Normal (20–40 s)',
+  short: 'Short (1–2 sentences)',
+  star: 'STAR',
+  technical: 'More technical',
+  simple: 'Simple language',
+  explain: 'Explain the question',
+}
+
+/** Model slugs to offer: the account's list in its order, plus any saved
+ * choice that is not (yet) in it so a selection is never silently lost. */
+export function modelChoices(models: ModelInfo[], selected: string[]): string[] {
+  const slugs = models.map((model) => model.slug)
+  for (const slug of selected) {
+    if (slug && !slugs.includes(slug)) slugs.unshift(slug)
+  }
+  return slugs
 }

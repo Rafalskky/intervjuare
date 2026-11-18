@@ -3,6 +3,7 @@ import CoreGraphics
 import CoreMedia
 import Darwin
 import Foundation
+import ImageIO
 import ScreenCaptureKit
 
 signal(SIGPIPE, SIG_IGN)
@@ -884,6 +885,75 @@ private func runSyntheticHarness() -> Int32 {
     return 0
 }
 
+struct ScreenshotResult: Encodable {
+    let type: String
+    let mime: String
+    let width: Int
+    let height: Int
+    let data: String
+}
+
+private let screenshotMaxDimension = 1600.0
+
+/// One still image for "Låt oss se". Captures only the selected meeting
+/// application's windows when a process id is given, otherwise the main
+/// display without Intervjuare's own windows. The JPEG goes to stdout only;
+/// nothing is written to disk.
+@available(macOS 14.0, *)
+private func captureScreenshot(applicationPid: pid_t?) async -> Int32 {
+    guard screenCapturePreflightGranted() else {
+        writeJSON(NativeEvent.error("screen_permission_denied", "Screen & System Audio Recording permission is not granted for Intervjuare, so the screen cannot be read. Grant it in System Settings → Privacy & Security → Screen & System Audio Recording."))
+        return 4
+    }
+    do {
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        let meetingApp = applicationPid.flatMap { pid in content.applications.first { $0.processID == pid } }
+        let meetingWindows = content.windows.filter {
+            $0.owningApplication?.processID == meetingApp?.processID && $0.isOnScreen && $0.frame.width > 200 && $0.frame.height > 150
+        }
+        let largestWindow = meetingWindows.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+        let display = largestWindow.flatMap { window in content.displays.first { $0.frame.intersects(window.frame) } }
+            ?? content.displays.first { $0.displayID == CGMainDisplayID() }
+            ?? content.displays.first
+        guard let display else {
+            writeJSON(NativeEvent.error("screen_capture_failed", "No display is available to capture."))
+            return 5
+        }
+        let filter: SCContentFilter
+        if let meetingApp, largestWindow != nil {
+            filter = SCContentFilter(display: display, including: [meetingApp], exceptingWindows: [])
+        } else {
+            let ownProcesses: Set<pid_t> = [ProcessInfo.processInfo.processIdentifier, getppid()]
+            let excluded = content.applications.filter { ownProcesses.contains($0.processID) }
+            filter = SCContentFilter(display: display, excludingApplications: excluded, exceptingWindows: [])
+        }
+        let configuration = SCStreamConfiguration()
+        let pointScale = Double(filter.pointPixelScale)
+        let pixelWidth = Double(display.width) * pointScale
+        let pixelHeight = Double(display.height) * pointScale
+        let scale = min(1.0, screenshotMaxDimension / max(pixelWidth, pixelHeight))
+        configuration.width = max(1, Int(pixelWidth * scale))
+        configuration.height = max(1, Int(pixelHeight * scale))
+        configuration.showsCursor = false
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        let buffer = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(buffer as CFMutableData, "public.jpeg" as CFString, 1, nil) else {
+            writeJSON(NativeEvent.error("screen_capture_failed", "Could not encode the screenshot."))
+            return 5
+        }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.72] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            writeJSON(NativeEvent.error("screen_capture_failed", "Could not encode the screenshot."))
+            return 5
+        }
+        writeJSON(ScreenshotResult(type: "screenshot", mime: "image/jpeg", width: image.width, height: image.height, data: (buffer as Data).base64EncodedString()))
+        return 0
+    } catch {
+        writeJSON(NativeEvent.error("screen_capture_failed", "Screen capture failed: \(error.localizedDescription)"))
+        return 5
+    }
+}
+
 let command = CommandLine.arguments.dropFirst().first ?? ""
 if command == "status" {
     status()
@@ -896,6 +966,13 @@ if command == "status" {
         await listSources()
     } else if command == "capture" {
         await runCapture()
+    } else if command == "screenshot" {
+        guard #available(macOS 14.0, *) else {
+            writeJSON(NativeEvent.error("unsupported_macos", "Screenshot assistance requires macOS 14 or newer."))
+            exit(3)
+        }
+        let pidArgument = CommandLine.arguments.dropFirst(2).first.flatMap { pid_t($0) }
+        exit(await captureScreenshot(applicationPid: pidArgument))
     } else {
         FileHandle.standardError.write(Data("unsupported command\n".utf8))
         exit(2)

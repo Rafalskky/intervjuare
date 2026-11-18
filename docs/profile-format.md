@@ -19,7 +19,7 @@ app ("Candidate profile" → Load profile).
   `situation`/`problem`/`action`/`result`, no stories at all, an id used in
   two sections.
 
-Hermes receives the raw file unchanged. Keys under `projects`, `stories`,
+The model receives the raw file unchanged. Keys under `projects`, `stories`,
 `experience`, `employment` and `education` are **ids**: suggestions cite them in
 `SOURCES`, and a cited id that does not exist is flagged in the UI.
 
@@ -34,4 +34,4 @@ Hermes receives the raw file unchanged. Keys under `projects`, `stories`,
 - Use stable, readable ids (`password_reset_race_condition`), since they are
   shown as sources.
 
-The schema may evolve; unknown sections are passed to Hermes as-is.
+The schema may evolve; unknown sections are passed to the model as-is.

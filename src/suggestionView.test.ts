@@ -7,6 +7,7 @@ import {
   formatSeconds,
   isSuggestionStale,
   latencySummary,
+  modelChoices,
   parseTopics,
 } from './suggestionView.ts'
 
@@ -22,6 +23,10 @@ function suggestion(id: number, status: SuggestionStatus, anchors: string[] = []
     noVerifiedExample: false,
     error: null,
     forced: false,
+    mode: 'normal',
+    alternative: false,
+    screen: false,
+    model: 'gpt-test',
     timing: { turnEndedAtMs: 1_000, requestedAtMs: 1_200, firstAnchorAtMs: null, firstAnswerAtMs: null, finishedAtMs: null },
   }
 }
@@ -66,9 +71,9 @@ test('an empty cancelled generation falls back, a partial one stays visible', ()
 })
 
 test('failures stay visible with their question', () => {
-  const failed = { ...suggestion(1, 'failed'), error: 'Hermes is not reachable' }
+  const failed = { ...suggestion(1, 'failed'), error: 'Could not reach chatgpt.com' }
   const view = applySuggestionEvent(EMPTY_SUGGESTION_VIEW, failed)
-  assert.equal(view.shown?.error, 'Hermes is not reachable')
+  assert.equal(view.shown?.error, 'Could not reach chatgpt.com')
 })
 
 test('suggestion becomes stale only when the interviewer speaks again after its turn', () => {
@@ -90,4 +95,10 @@ test('latency is measured from request and from end of speech', () => {
 
 test('topics accept commas and new lines', () => {
   assert.deepEqual(parseTopics('backend, APIs\n Java ,, testing\n'), ['backend', 'APIs', 'Java', 'testing'])
+})
+
+test('model choices keep saved selections that the account list lacks', () => {
+  const models = [{ slug: 'gpt-6-luna', description: '' }, { slug: 'gpt-6.2-sol', description: '' }]
+  assert.deepEqual(modelChoices(models, ['gpt-6-luna', '']), ['gpt-6-luna', 'gpt-6.2-sol'])
+  assert.deepEqual(modelChoices([], ['gpt-6-luna', 'gpt-6.1-terra']), ['gpt-6.1-terra', 'gpt-6-luna'])
 })

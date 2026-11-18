@@ -1,4 +1,4 @@
-//! Progressive parser for the Hermes plain-text response contract:
+//! Progressive parser for the model's plain-text response contract:
 //!
 //! ```text
 //! ANCHORS

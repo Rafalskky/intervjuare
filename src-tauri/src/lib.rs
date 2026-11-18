@@ -14,12 +14,17 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod codex_auth;
 mod context;
 mod conversation;
 mod copilot;
-mod hermes;
+mod llm;
+mod memory;
 mod profile;
+mod screen;
+mod settings;
 mod suggestion;
+mod voice_command;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 
@@ -1506,6 +1511,7 @@ fn start_audio_capture(
     if config.language != "sv" && config.language != "en" {
         return Err("Language must be Swedish or English.".into());
     }
+    app.state::<copilot::Copilot>().set_screen_application(Some(config.application_id.clone()));
     let pending = {
         let mut guard = runtime.0.lock().map_err(|_| "audio runtime poisoned".to_string())?;
         if guard.session.is_some() {
@@ -7321,8 +7327,11 @@ pub fn run() {
             copilot::load_candidate_profile,
             copilot::set_job_context,
             copilot::set_auto_answer,
-            copilot::check_hermes,
+            copilot::set_answer_mode,
+            copilot::set_model_settings,
+            copilot::check_connection,
             copilot::force_answer,
+            copilot::capture_screen_answer,
             copilot::submit_test_turn,
             copilot::clear_conversation,
             copilot::cancel_suggestion

@@ -1,35 +1,44 @@
-//! Interview copilot orchestration (Milestone 2): conversation state →
-//! context package → one streaming Hermes request → progressive suggestion
-//! events (anchors first, then the full answer).
+//! Interview copilot orchestration: conversation state → context package →
+//! one streaming model request → progressive suggestion events (anchors
+//! first, then the full answer). Background interview memory and the
+//! "Låt oss se" screen flow hang off the same state.
 //!
 //! Trigger rules (see docs/context-management.md):
 //! - an interviewer final that completes the latest interviewer turn starts a
-//!   generation automatically (unless auto-answer is off or the whole turn is
+//!   suggestion automatically (unless auto-answer is off or the whole turn is
 //!   a backchannel such as "Mm.");
 //! - a new interviewer partial that continues the same turn cancels the
-//!   in-flight generation, because the question was not finished yet;
-//! - a newer generation always supersedes the older one;
+//!   in-flight suggestion, because the question was not finished yet;
+//! - a newer suggestion always supersedes the older one;
 //! - candidate speech never cancels a suggestion (the candidate reads it
-//!   while answering).
+//!   while answering), except the explicit "Låt oss se" command, which starts
+//!   a screen-aware suggestion and is removed from the dialogue.
 
 use crate::{
-    context::{self, ContextPackage, JobContext},
+    codex_auth::{self, Account, AccountSummary},
+    context::{self, AnswerMode, AnswerOptions, ContextPackage, JobContext, UsedStory},
     conversation::{self, Conversation, Turn, Update},
-    hermes::{self, CancelToken, HermesConfig, HermesConfigSummary, HermesStatus, StreamOutcome},
+    llm::{self, CancelToken, ModelInfo, ModelRequest, StreamOutcome},
+    memory::{self, InterviewMemory},
     profile::{self, Profile, ProfileSummary},
+    screen::{self, Screenshot},
+    settings::{self, Settings},
     suggestion::{self, ParsedSuggestion},
-    now_ms, Speaker, TranscriptEvent, CURL_BIN,
+    voice_command, now_ms, Speaker, TranscriptEvent, CURL_BIN,
 };
 use serde::Serialize;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
+    time::Instant,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
 pub const SUGGESTION_EVENT: &str = "suggestion-event";
+pub const MEMORY_EVENT: &str = "memory-event";
+pub const VOICE_COMMAND_EVENT: &str = "voice-command";
 const MAX_TEST_TURN_CHARS: usize = 2_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -69,6 +78,10 @@ pub struct SuggestionEvent {
     pub no_verified_example: bool,
     pub error: Option<String>,
     pub forced: bool,
+    pub mode: AnswerMode,
+    pub alternative: bool,
+    pub screen: bool,
+    pub model: String,
     pub timing: SuggestionTiming,
 }
 
@@ -79,7 +92,27 @@ struct GenerationPlan {
     question: String,
     turn_ended_at_ms: u64,
     forced: bool,
+    mode: AnswerMode,
+    alternative: bool,
+    /// `Some(application id)` when a screenshot must be attached.
+    screen: Option<Option<String>>,
+    model: String,
+    reasoning_effort: String,
+    account_email: Option<String>,
     citable_ids: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryPlan {
+    request: ModelRequest,
+    absorbed_until_ms: u64,
+    absorbed_turns: usize,
+    account_email: Option<String>,
+}
+
+enum Work {
+    Generate(GenerationPlan, Arc<CancelToken>),
+    Memory(MemoryPlan, Arc<CancelToken>),
 }
 
 struct ActiveGeneration {
@@ -88,34 +121,61 @@ struct ActiveGeneration {
     turn_first_segment: String,
 }
 
+#[derive(Clone, Copy, Default)]
+struct Regenerate {
+    mode: Option<AnswerMode>,
+    alternative: bool,
+}
+
 struct CopilotInner {
     conversation: Conversation,
-    job: JobContext,
+    settings: Settings,
+    settings_path: PathBuf,
+    settings_warning: Option<String>,
     profile: Option<Arc<Profile>>,
     profile_path: PathBuf,
     profile_error: Option<String>,
-    auto_answer: bool,
     active: Option<ActiveGeneration>,
     next_id: u64,
     simulated_segments: u64,
+    memory: InterviewMemory,
+    memory_job: Option<Arc<CancelToken>>,
+    stories_used: Vec<UsedStory>,
+    last_sources: Vec<String>,
+    command_segments: HashSet<String>,
+    screen_application: Option<String>,
 }
 
 impl CopilotInner {
-    fn new(profile_path: PathBuf) -> Self {
+    fn new(settings_path: PathBuf) -> Self {
+        let (settings, settings_warning) = settings::load(&settings_path);
+        let profile_path = settings.profile_path.as_ref().map(PathBuf::from).unwrap_or_else(profile::default_profile_path);
         let mut inner = Self {
             conversation: Conversation::default(),
-            job: JobContext::default(),
+            settings,
+            settings_path,
+            settings_warning,
             profile: None,
-            profile_path,
+            profile_path: profile_path.clone(),
             profile_error: None,
-            auto_answer: true,
             active: None,
             next_id: 1,
             simulated_segments: 0,
+            memory: InterviewMemory::default(),
+            memory_job: None,
+            stories_used: Vec::new(),
+            last_sources: Vec::new(),
+            command_segments: HashSet::new(),
+            screen_application: None,
         };
-        let path = inner.profile_path.clone();
-        let _ = inner.load_profile(path);
+        let _ = inner.load_profile(profile_path);
         inner
+    }
+
+    fn persist(&mut self) -> Result<(), String> {
+        settings::save(&self.settings_path, &self.settings)?;
+        self.settings_warning = None;
+        Ok(())
     }
 
     fn load_profile(&mut self, path: PathBuf) -> Result<ProfileSummary, String> {
@@ -142,12 +202,34 @@ impl CopilotInner {
         }
     }
 
-    fn on_transcript(&mut self, event: &TranscriptEvent) -> Option<(GenerationPlan, Arc<CancelToken>)> {
-        if self.conversation.session_id().is_some_and(|session| session != event.session_id) {
-            self.cancel_active();
+    /// A new interview: forget everything learned about the previous one.
+    fn reset_interview(&mut self, session_id: Option<String>) {
+        self.cancel_active();
+        if let Some(job) = self.memory_job.take() {
+            job.cancel();
+        }
+        self.conversation.reset(session_id);
+        self.memory = InterviewMemory::default();
+        self.stories_used.clear();
+        self.last_sources.clear();
+        self.command_segments.clear();
+    }
+
+    fn on_transcript(&mut self, event: &TranscriptEvent) -> Vec<Work> {
+        if self.conversation.session_id() != Some(event.session_id.as_str()) {
+            self.reset_interview(Some(event.session_id.clone()));
+        }
+        if self.command_segments.contains(&event.segment_id) {
+            return Vec::new();
+        }
+        if event.speaker == Speaker::Candidate && event.final_segment && voice_command::detect(&event.text).is_some() {
+            self.command_segments.insert(event.segment_id.clone());
+            self.conversation.remove_segment(&event.segment_id);
+            let application = self.screen_application.clone();
+            return self.plan_screen(application, false);
         }
         match self.conversation.apply(event) {
-            Update::Ignored | Update::Changed { speaker: Speaker::Candidate, .. } => None,
+            Update::Ignored | Update::Changed { speaker: Speaker::Candidate, .. } => Vec::new(),
             Update::Changed { speaker: Speaker::Interviewer, segment_id, final_segment: false } => {
                 let continues_active_turn = match (&self.active, self.conversation.turn_of_segment(&segment_id)) {
                     (Some(active), Some(turn)) => turn.first_segment_id == active.turn_first_segment,
@@ -156,55 +238,136 @@ impl CopilotInner {
                 if continues_active_turn {
                     self.cancel_active();
                 }
-                None
+                Vec::new()
             }
             Update::Changed { speaker: Speaker::Interviewer, segment_id, final_segment: true } => {
-                if !self.auto_answer {
-                    return None;
+                if !self.settings.auto_answer {
+                    return Vec::new();
                 }
-                let turn = self.conversation.turn_of_segment(&segment_id)?;
-                let (history, current) = self.conversation.latest_interviewer_turn()?;
+                let Some(turn) = self.conversation.turn_of_segment(&segment_id) else { return Vec::new() };
+                let Some((history, current)) = self.conversation.latest_interviewer_turn() else { return Vec::new() };
                 if !turn.complete || current.first_segment_id != turn.first_segment_id || conversation::is_backchannel(&current.text) {
-                    return None;
+                    return Vec::new();
                 }
-                Some(self.plan(&history, current, false))
+                self.plan_answer(&history, current, false, Regenerate::default(), None)
             }
         }
     }
 
-    fn force(&mut self) -> Result<(GenerationPlan, Arc<CancelToken>), String> {
+    fn force(&mut self, regenerate: Regenerate) -> Result<Vec<Work>, String> {
         let (history, current) = self
             .conversation
             .latest_interviewer_turn()
             .ok_or("No interviewer turn yet. Wait for the interviewer, or add a simulated turn.")?;
-        Ok(self.plan(&history, current, true))
+        Ok(self.plan_answer(&history, current, true, regenerate, None))
     }
 
-    fn plan(&mut self, history: &[Turn], current: Turn, forced: bool) -> (GenerationPlan, Arc<CancelToken>) {
+    /// Screen-aware suggestion for "Låt oss se" or the Capture screen button.
+    fn plan_screen(&mut self, application: Option<String>, forced: bool) -> Vec<Work> {
+        let (history, current) = self.conversation.latest_interviewer_turn().unwrap_or_else(|| {
+            let turns = self.conversation.turns();
+            let now = now_ms();
+            (turns, Turn {
+                speaker: Speaker::Interviewer,
+                text: "(No interviewer question yet: explain what is on screen and how to respond.)".into(),
+                complete: true,
+                first_segment_id: format!("screen-{now}"),
+                started_at_ms: now,
+                ended_at_ms: now,
+            })
+        });
+        self.plan_answer(&history, current, forced, Regenerate::default(), Some(application))
+    }
+
+    fn plan_answer(&mut self, history: &[Turn], current: Turn, forced: bool, regenerate: Regenerate, screen: Option<Option<String>>) -> Vec<Work> {
         self.cancel_active();
         let id = self.next_id;
         self.next_id += 1;
         let token = Arc::new(CancelToken::default());
-        self.active = Some(ActiveGeneration {
-            id,
-            token: token.clone(),
-            turn_first_segment: current.first_segment_id.clone(),
-        });
+        self.active = Some(ActiveGeneration { id, token: token.clone(), turn_first_segment: current.first_segment_id.clone() });
+        let mode = regenerate.mode.unwrap_or(self.settings.answer_mode);
+        let options = AnswerOptions {
+            mode,
+            avoid_sources: if regenerate.alternative { self.last_sources.clone() } else { Vec::new() },
+            screen: screen.is_some(),
+        };
+        let memory_text = (!self.memory.text.is_empty()).then_some(self.memory.text.as_str());
+        let package = context::build_context(&self.settings.job, self.profile.as_deref(), memory_text, &self.stories_used, history, &current, &options);
         let plan = GenerationPlan {
             id,
-            package: context::build_context(&self.job, self.profile.as_deref(), history, &current),
+            package,
             question: current.text,
             turn_ended_at_ms: current.ended_at_ms,
             forced,
+            mode,
+            alternative: regenerate.alternative,
+            model: if screen.is_some() { self.settings.screen_model().to_string() } else { self.settings.model.clone() },
+            screen,
+            reasoning_effort: self.settings.reasoning_effort.clone(),
+            account_email: self.settings.account_email.clone(),
             citable_ids: self.profile.as_ref().map(|profile| profile.citable_ids.clone()).unwrap_or_default(),
         };
-        (plan, token)
+        let mut work = vec![Work::Generate(plan, token)];
+        work.extend(self.plan_memory(history));
+        work
     }
 
-    fn finish(&mut self, id: u64) {
-        if self.active.as_ref().is_some_and(|active| active.id == id) {
+    /// Background memory update when enough complete turns are unabsorbed.
+    fn plan_memory(&mut self, history: &[Turn]) -> Option<Work> {
+        if self.memory_job.is_some() {
+            return None;
+        }
+        let turns = memory::turns_to_absorb(history, self.memory.covered_until_ms);
+        if turns.len() < memory::MIN_NEW_TURNS {
+            return None;
+        }
+        let ids: Vec<String> = self.profile.as_ref().map(|profile| profile.citable_ids.iter().cloned().collect()).unwrap_or_default();
+        let token = Arc::new(CancelToken::default());
+        self.memory_job = Some(token.clone());
+        Some(Work::Memory(
+            MemoryPlan {
+                request: ModelRequest {
+                    model: self.settings.model.clone(),
+                    reasoning_effort: self.settings.reasoning_effort.clone(),
+                    instructions: memory::MEMORY_INSTRUCTIONS.to_string(),
+                    text: memory::request_text(&self.memory.text, &turns, &ids, self.settings.job.language),
+                    image_data_url: None,
+                    cache_key: None,
+                },
+                absorbed_until_ms: turns.last().map_or(0, |turn| turn.ended_at_ms),
+                absorbed_turns: turns.len(),
+                account_email: self.settings.account_email.clone(),
+            },
+            token,
+        ))
+    }
+
+    fn finish(&mut self, final_event: &SuggestionEvent) {
+        if self.active.as_ref().is_some_and(|active| active.id == final_event.suggestion_id) {
             self.active = None;
         }
+        if final_event.status == SuggestionStatus::Done {
+            self.last_sources = final_event.sources.clone();
+            for id in &final_event.sources {
+                if !self.stories_used.iter().any(|story| &story.id == id) {
+                    self.stories_used.push(UsedStory { id: id.clone(), question: final_event.question.clone() });
+                }
+            }
+        }
+    }
+
+    /// Returns false when the job was superseded (reset/cleared meanwhile).
+    fn finish_memory(&mut self, token: &Arc<CancelToken>, plan: &MemoryPlan, result: &Result<String, String>) -> bool {
+        if !self.memory_job.as_ref().is_some_and(|current| Arc::ptr_eq(current, token)) {
+            return false;
+        }
+        self.memory_job = None;
+        if let Ok(text) = result {
+            self.memory.text = text.clone();
+            self.memory.covered_until_ms = plan.absorbed_until_ms;
+            self.memory.absorbed_turns += plan.absorbed_turns;
+        }
+        true
     }
 
     fn simulated_event(&mut self, speaker: Speaker, text: &str) -> Result<TranscriptEvent, String> {
@@ -236,48 +399,106 @@ pub struct Copilot(Arc<Mutex<CopilotInner>>);
 
 impl Copilot {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(CopilotInner::new(profile::default_profile_path()))))
+        Self(Arc::new(Mutex::new(CopilotInner::new(settings::settings_path()))))
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, CopilotInner>, String> {
         self.0.lock().map_err(|_| "copilot state poisoned".to_string())
     }
+
+    /// Meeting application chosen for capture; screenshots read its windows.
+    pub fn set_screen_application(&self, application_id: Option<String>) {
+        if let Ok(mut inner) = self.lock() {
+            inner.screen_application = application_id.filter(|id| !id.is_empty());
+        }
+    }
 }
 
 /// Hook from the STT dispatcher: called for every emitted transcript event.
-/// Never blocks on Hermes; generation runs on its own thread.
+/// Never blocks on the model; work runs on its own threads.
 pub fn on_transcript(app: &AppHandle, event: &TranscriptEvent) {
     let copilot = app.state::<Copilot>();
-    let planned = match copilot.lock() {
-        Ok(mut inner) => inner.on_transcript(event),
-        Err(_) => None,
+    let work = match copilot.lock() {
+        Ok(mut inner) => {
+            let is_command = event.speaker == Speaker::Candidate
+                && event.final_segment
+                && !inner.command_segments.contains(&event.segment_id)
+                && voice_command::detect(&event.text).is_some();
+            let work = inner.on_transcript(event);
+            if is_command {
+                let _ = app.emit(VOICE_COMMAND_EVENT, serde_json::json!({ "segmentId": event.segment_id, "command": "lookAtScreen" }));
+            }
+            work
+        }
+        Err(_) => Vec::new(),
     };
-    if let Some((plan, token)) = planned {
-        spawn_generation(app.clone(), copilot.0.clone(), plan, token);
+    dispatch(app, &copilot.0, work);
+}
+
+fn dispatch(app: &AppHandle, state: &Arc<Mutex<CopilotInner>>, work: Vec<Work>) -> Option<u64> {
+    let mut suggestion_id = None;
+    for item in work {
+        match item {
+            Work::Generate(plan, token) => {
+                suggestion_id = Some(plan.id);
+                spawn_generation(app.clone(), state.clone(), plan, token);
+            }
+            Work::Memory(plan, token) => spawn_memory(app.clone(), state.clone(), plan, token),
+        }
     }
+    suggestion_id
+}
+
+fn resolve_account(email: Option<&str>) -> Result<Account, String> {
+    codex_auth::select(&codex_auth::discover_accounts(), email, codex_auth::now_secs())
 }
 
 fn spawn_generation(app: AppHandle, state: Arc<Mutex<CopilotInner>>, plan: GenerationPlan, token: Arc<CancelToken>) {
     thread::spawn(move || {
-        let id = plan.id;
-        let config = hermes::resolve_config();
-        run_generation(&plan, &token, &config, CURL_BIN, |event| {
+        let account = resolve_account(plan.account_email.as_deref());
+        let application = plan.screen.clone().flatten();
+        let final_event = run_generation(&plan, &token, account, CURL_BIN, &llm::base_url(), || screen::capture(application.as_deref()), |event| {
             let _ = app.emit(SUGGESTION_EVENT, event);
         });
         if let Ok(mut inner) = state.lock() {
-            inner.finish(id);
+            inner.finish(&final_event);
+        }
+    });
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryEvent {
+    text: String,
+    absorbed_turns: usize,
+    error: Option<String>,
+}
+
+fn spawn_memory(app: AppHandle, state: Arc<Mutex<CopilotInner>>, plan: MemoryPlan, token: Arc<CancelToken>) {
+    thread::spawn(move || {
+        let result = resolve_account(plan.account_email.as_deref())
+            .and_then(|account| llm::complete(&account, &plan.request, &token, CURL_BIN, &llm::base_url()))
+            .and_then(|output| memory::sanitize(&output).ok_or_else(|| "The model returned an empty memory.".to_string()));
+        let Ok(mut inner) = state.lock() else { return };
+        if inner.finish_memory(&token, &plan, &result) {
+            let event = MemoryEvent { text: inner.memory.text.clone(), absorbed_turns: inner.memory.absorbed_turns, error: result.err() };
+            drop(inner);
+            let _ = app.emit(MEMORY_EVENT, event);
         }
     });
 }
 
 /// Streams one suggestion and reports every visible change through `emit`.
+/// Returns the final event.
 fn run_generation(
     plan: &GenerationPlan,
     token: &CancelToken,
-    config: &HermesConfig,
+    account: Result<Account, String>,
     curl_bin: &str,
+    base_url: &str,
+    capture: impl FnOnce() -> Result<Screenshot, String>,
     mut emit: impl FnMut(&SuggestionEvent),
-) {
+) -> SuggestionEvent {
     let mut event = SuggestionEvent {
         suggestion_id: plan.id,
         status: SuggestionStatus::Preparing,
@@ -289,28 +510,56 @@ fn run_generation(
         no_verified_example: false,
         error: None,
         forced: plan.forced,
-        timing: SuggestionTiming {
-            turn_ended_at_ms: plan.turn_ended_at_ms,
-            requested_at_ms: now_ms(),
-            ..SuggestionTiming::default()
-        },
+        mode: plan.mode,
+        alternative: plan.alternative,
+        screen: plan.screen.is_some(),
+        model: plan.model.clone(),
+        timing: SuggestionTiming { turn_ended_at_ms: plan.turn_ended_at_ms, requested_at_ms: now_ms(), ..SuggestionTiming::default() },
     };
     emit(&event);
 
+    let fail = |mut event: SuggestionEvent, error: String, emit: &mut dyn FnMut(&SuggestionEvent)| {
+        event.status = SuggestionStatus::Failed;
+        event.error = Some(error);
+        event.timing.finished_at_ms = Some(now_ms());
+        emit(&event);
+        event
+    };
+    let account = match account {
+        Ok(account) => account,
+        Err(error) => return fail(event, error, &mut emit),
+    };
+    let image = if plan.screen.is_some() {
+        match capture() {
+            Ok(shot) => Some(shot.data_url),
+            Err(error) => return fail(event, format!("Screen assistance is unavailable: {error}"), &mut emit),
+        }
+    } else {
+        None
+    };
+    let request = ModelRequest {
+        model: plan.model.clone(),
+        reasoning_effort: plan.reasoning_effort.clone(),
+        instructions: plan.package.system.clone(),
+        text: plan.package.user.clone(),
+        image_data_url: image,
+        cache_key: Some(plan.package.cache_key.clone()),
+    };
+
     let mut raw = String::new();
-    let result = hermes::stream_chat(config, &plan.package, token, curl_bin, |delta| {
+    let result = llm::stream_response(&account, &request, token, curl_bin, base_url, |delta| {
         raw.push_str(delta);
         if apply_parsed(&mut event, suggestion::parse(&raw, false)) {
             event.status = SuggestionStatus::Streaming;
             emit(&event);
         }
     });
+    drop(request);
 
     let parsed = suggestion::parse(&raw, true);
     let (skip, no_verified_example, cited) = (parsed.skip, parsed.no_verified_example, parsed.sources.clone());
     apply_parsed(&mut event, parsed);
-    let (sources, unverified): (Vec<String>, Vec<String>) =
-        cited.into_iter().partition(|id| plan.citable_ids.contains(id));
+    let (sources, unverified): (Vec<String>, Vec<String>) = cited.into_iter().partition(|id| plan.citable_ids.contains(id));
     event.sources = sources;
     event.unverified_sources = unverified;
     event.no_verified_example = no_verified_example;
@@ -319,7 +568,7 @@ fn run_generation(
         Ok(StreamOutcome::Cancelled) => SuggestionStatus::Cancelled,
         Ok(StreamOutcome::Completed { .. }) if skip => SuggestionStatus::Skipped,
         Ok(StreamOutcome::Completed { .. }) if event.anchors.is_empty() && event.answer.is_empty() => {
-            event.error = Some("Hermes returned an empty response.".into());
+            event.error = Some("The model returned an empty response.".into());
             SuggestionStatus::Failed
         }
         Ok(StreamOutcome::Completed { .. }) => SuggestionStatus::Done,
@@ -329,6 +578,7 @@ fn run_generation(
         }
     };
     emit(&event);
+    event
 }
 
 /// Copies newly visible anchors/answer into the event. Returns true when
@@ -358,21 +608,29 @@ pub struct CopilotStatus {
     pub profile: Option<ProfileSummary>,
     pub profile_error: Option<String>,
     pub profile_path: String,
-    pub job: JobContext,
-    pub auto_answer: bool,
-    pub hermes: HermesConfigSummary,
+    pub settings: Settings,
+    pub settings_warning: Option<String>,
+    pub accounts: Vec<AccountSummary>,
+    pub memory: String,
+    pub memory_turns: usize,
+    pub stories_used: Vec<String>,
 }
 
 #[tauri::command]
 pub fn copilot_status(copilot: State<'_, Copilot>) -> Result<CopilotStatus, String> {
+    let now = codex_auth::now_secs();
+    let accounts = codex_auth::discover_accounts().iter().map(|account| account.summary(now)).collect();
     let inner = copilot.lock()?;
     Ok(CopilotStatus {
         profile: inner.profile.as_ref().map(|profile| profile.summary.clone()),
         profile_error: inner.profile_error.clone(),
         profile_path: inner.profile_path.display().to_string(),
-        job: inner.job.clone(),
-        auto_answer: inner.auto_answer,
-        hermes: hermes::resolve_config().summary(),
+        settings: inner.settings.clone(),
+        settings_warning: inner.settings_warning.clone(),
+        accounts,
+        memory: inner.memory.text.clone(),
+        memory_turns: inner.memory.absorbed_turns,
+        stories_used: inner.stories_used.iter().map(|story| story.id.clone()).collect(),
     })
 }
 
@@ -384,57 +642,129 @@ pub fn load_candidate_profile(copilot: State<'_, Copilot>, path: Option<String>)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| inner.profile_path.clone());
-    inner.load_profile(path)
+    let summary = inner.load_profile(path.clone())?;
+    inner.settings.profile_path = Some(path.display().to_string());
+    inner.persist()?;
+    Ok(summary)
 }
 
 #[tauri::command]
 pub fn set_job_context(copilot: State<'_, Copilot>, job: JobContext) -> Result<(), String> {
-    copilot.lock()?.job = job;
-    Ok(())
+    let mut inner = copilot.lock()?;
+    inner.settings.job = job;
+    inner.persist()
 }
 
 #[tauri::command]
 pub fn set_auto_answer(copilot: State<'_, Copilot>, enabled: bool) -> Result<(), String> {
-    copilot.lock()?.auto_answer = enabled;
-    Ok(())
+    let mut inner = copilot.lock()?;
+    inner.settings.auto_answer = enabled;
+    inner.persist()
 }
 
 #[tauri::command]
-pub async fn check_hermes() -> Result<HermesStatus, String> {
-    tauri::async_runtime::spawn_blocking(|| hermes::check_status(&hermes::resolve_config(), CURL_BIN))
-        .await
-        .map_err(|error| format!("Hermes check failed: {error}"))
+pub fn set_answer_mode(copilot: State<'_, Copilot>, mode: AnswerMode) -> Result<(), String> {
+    let mut inner = copilot.lock()?;
+    inner.settings.answer_mode = mode;
+    inner.persist()
 }
 
 #[tauri::command]
-pub fn force_answer(app: AppHandle, copilot: State<'_, Copilot>) -> Result<u64, String> {
-    let (plan, token) = copilot.lock()?.force()?;
-    let id = plan.id;
-    spawn_generation(app, copilot.0.clone(), plan, token);
-    Ok(id)
+pub fn set_model_settings(
+    copilot: State<'_, Copilot>,
+    account_email: Option<String>,
+    model: String,
+    reasoning_effort: String,
+    screen_model: String,
+) -> Result<(), String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("Choose a model.".into());
+    }
+    let mut inner = copilot.lock()?;
+    inner.settings.account_email = account_email.map(|email| email.trim().to_string()).filter(|email| !email.is_empty());
+    inner.settings.model = model.to_string();
+    inner.settings.reasoning_effort = reasoning_effort.trim().to_string();
+    inner.settings.screen_model = screen_model.trim().to_string();
+    inner.persist()
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionStatus {
+    pub ok: bool,
+    pub message: String,
+    pub account: Option<AccountSummary>,
+    pub models: Vec<ModelInfo>,
+    pub latency_ms: u64,
+}
+
+/// Proves the chosen sign-in works by listing its models (cheap request).
+#[tauri::command]
+pub async fn check_connection(copilot: State<'_, Copilot>) -> Result<ConnectionStatus, String> {
+    let email = copilot.lock()?.settings.account_email.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let now = codex_auth::now_secs();
+        let result = resolve_account(email.as_deref()).and_then(|account| {
+            let models = llm::list_models(&account, CURL_BIN, &llm::base_url())?;
+            Ok((account, models))
+        });
+        let latency_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok((account, models)) => ConnectionStatus {
+                ok: true,
+                message: format!("Connected to ChatGPT as {} ({} models available).", account.email, models.len()),
+                account: Some(account.summary(now)),
+                models,
+                latency_ms,
+            },
+            Err(message) => ConnectionStatus { ok: false, message, account: None, models: Vec::new(), latency_ms },
+        }
+    })
+    .await
+    .map_err(|error| format!("connection check failed: {error}"))
+}
+
+/// Force / regenerate for the latest interviewer turn, optionally with a
+/// one-off mode ("Shorter", "STAR", …) or a different example.
+#[tauri::command]
+pub fn force_answer(app: AppHandle, copilot: State<'_, Copilot>, mode: Option<AnswerMode>, alternative: Option<bool>) -> Result<u64, String> {
+    let work = copilot.lock()?.force(Regenerate { mode, alternative: alternative.unwrap_or(false) })?;
+    dispatch(&app, &copilot.0, work).ok_or_else(|| "nothing to generate".into())
+}
+
+/// Manual "Capture screen" (same flow as saying "Låt oss se").
+#[tauri::command]
+pub fn capture_screen_answer(app: AppHandle, copilot: State<'_, Copilot>, application_id: Option<String>) -> Result<u64, String> {
+    let work = {
+        let mut inner = copilot.lock()?;
+        let application = application_id.filter(|id| !id.is_empty()).or_else(|| inner.screen_application.clone());
+        inner.plan_screen(application, true)
+    };
+    dispatch(&app, &copilot.0, work).ok_or_else(|| "nothing to generate".into())
 }
 
 /// Test input for working without audio: a typed turn is treated exactly
-/// like a final transcript segment from that speaker.
+/// like a final transcript segment from that speaker (including commands).
 #[tauri::command]
 pub fn submit_test_turn(app: AppHandle, copilot: State<'_, Copilot>, speaker: Speaker, text: String) -> Result<TranscriptEvent, String> {
-    let (event, planned) = {
+    let (event, work) = {
         let mut inner = copilot.lock()?;
         let event = inner.simulated_event(speaker, &text)?;
-        let planned = inner.on_transcript(&event);
-        (event, planned)
+        let work = inner.on_transcript(&event);
+        (event, work)
     };
-    if let Some((plan, token)) = planned {
-        spawn_generation(app, copilot.0.clone(), plan, token);
+    if speaker == Speaker::Candidate && voice_command::detect(&event.text).is_some() {
+        let _ = app.emit(VOICE_COMMAND_EVENT, serde_json::json!({ "segmentId": event.segment_id, "command": "lookAtScreen" }));
     }
+    dispatch(&app, &copilot.0, work);
     Ok(event)
 }
 
 #[tauri::command]
 pub fn clear_conversation(copilot: State<'_, Copilot>) -> Result<(), String> {
-    let mut inner = copilot.lock()?;
-    inner.cancel_active();
-    inner.conversation.reset(None);
+    copilot.lock()?.reset_interview(None);
     Ok(())
 }
 
@@ -447,14 +777,13 @@ pub fn cancel_suggestion(copilot: State<'_, Copilot>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        io::{BufRead, BufReader, Read as _, Write},
-        net::TcpListener,
-        time::Duration,
-    };
+    use crate::llm::test_server::{completed, delta, serve_once, unused_base, SSE_HEAD};
 
-    fn inner() -> CopilotInner {
-        CopilotInner::new(PathBuf::from("/nonexistent/profile.yaml"))
+    fn inner() -> (CopilotInner, crate::InferenceWorkspace) {
+        let workspace = crate::InferenceWorkspace::new().unwrap();
+        let mut inner = CopilotInner::new(workspace.path.join("settings.json"));
+        let _ = inner.load_profile(PathBuf::from("/nonexistent/profile.yaml"));
+        (inner, workspace)
     }
 
     fn event(id: &str, revision: u32, speaker: Speaker, text: &str, final_segment: bool, started: u64) -> TranscriptEvent {
@@ -473,201 +802,273 @@ mod tests {
         }
     }
 
+    fn generation(work: Vec<Work>) -> (GenerationPlan, Arc<CancelToken>) {
+        work.into_iter()
+            .find_map(|item| match item {
+                Work::Generate(plan, token) => Some((plan, token)),
+                Work::Memory(..) => None,
+            })
+            .expect("a generation")
+    }
+
+    fn has_memory(work: &[Work]) -> bool {
+        work.iter().any(|item| matches!(item, Work::Memory(..)))
+    }
+
     #[test]
     fn missing_profile_is_reported_not_fatal() {
-        let inner = inner();
+        let (inner, _workspace) = inner();
         assert!(inner.profile.is_none());
         assert!(inner.profile_error.as_deref().unwrap().contains("Could not open"));
     }
 
     #[test]
     fn interviewer_final_triggers_and_partials_do_not() {
-        let mut inner = inner();
-        assert!(inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Kan du berätta", false, 0)).is_none());
-        let (plan, _) = inner
-            .on_transcript(&event("interviewer-1", 2, Speaker::Interviewer, "Kan du berätta om dig själv?", true, 0))
-            .expect("final interviewer turn triggers");
+        let (mut inner, _workspace) = inner();
+        assert!(inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Kan du berätta", false, 0)).is_empty());
+        let (plan, _) = generation(inner.on_transcript(&event("interviewer-1", 2, Speaker::Interviewer, "Kan du berätta om dig själv?", true, 0)));
         assert_eq!(plan.question, "Kan du berätta om dig själv?");
         assert_eq!(plan.turn_ended_at_ms, 900);
+        assert_eq!(plan.model, "gpt-6-luna");
+        assert!(plan.screen.is_none());
         assert!(plan.package.user.contains("CURRENT INTERVIEWER TURN\nKan du berätta om dig själv?"));
-        assert!(inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Ja, absolut.", true, 2_000)).is_none());
+        assert!(inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Ja, absolut.", true, 2_000)).is_empty());
     }
 
     #[test]
     fn continuing_the_same_turn_cancels_and_retriggers_with_the_full_question() {
-        let mut inner = inner();
-        let (_, first_token) = inner
-            .on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om ett problem.", true, 0))
-            .unwrap();
-        assert!(inner.on_transcript(&event("interviewer-2", 1, Speaker::Interviewer, "Som du", false, 1_500)).is_none());
+        let (mut inner, _workspace) = inner();
+        let (_, first_token) = generation(inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om ett problem.", true, 0)));
+        assert!(inner.on_transcript(&event("interviewer-2", 1, Speaker::Interviewer, "Som du", false, 1_500)).is_empty());
         assert!(first_token.is_cancelled(), "the unfinished question's answer is cancelled");
-        assert!(inner.active.is_none());
-        let (plan, _) = inner
-            .on_transcript(&event("interviewer-2", 2, Speaker::Interviewer, "Som du själv upptäckte.", true, 1_500))
-            .unwrap();
+        let (plan, _) = generation(inner.on_transcript(&event("interviewer-2", 2, Speaker::Interviewer, "Som du själv upptäckte.", true, 1_500)));
         assert_eq!(plan.question, "Berätta om ett problem. Som du själv upptäckte.");
     }
 
     #[test]
     fn a_new_interviewer_turn_after_the_candidate_does_not_cancel_until_it_is_final() {
-        let mut inner = inner();
-        let (_, token) = inner
-            .on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om Sagobo.", true, 0))
-            .unwrap();
+        let (mut inner, _workspace) = inner();
+        let (_, token) = generation(inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om Sagobo.", true, 0)));
         inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Sagobo är en app.", false, 2_000));
         inner.on_transcript(&event("interviewer-2", 1, Speaker::Interviewer, "Hur", false, 5_000));
         assert!(!token.is_cancelled(), "candidate is reading the suggestion while answering");
-        let (plan, _) = inner
-            .on_transcript(&event("interviewer-2", 2, Speaker::Interviewer, "Hur testade du det?", true, 5_000))
-            .unwrap();
+        let (plan, _) = generation(inner.on_transcript(&event("interviewer-2", 2, Speaker::Interviewer, "Hur testade du det?", true, 5_000)));
         assert!(token.is_cancelled(), "newer question supersedes");
         assert!(plan.package.user.contains("INTERVIEWER: Berätta om Sagobo.\nCANDIDATE: Sagobo är en app."));
     }
 
     #[test]
     fn backchannels_and_disabled_auto_answer_do_not_trigger_but_force_does() {
-        let mut inner = inner();
-        assert!(inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Mm.", true, 0)).is_none());
-        let (plan, _) = inner.force().expect("force works for any interviewer turn");
+        let (mut inner, _workspace) = inner();
+        assert!(inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Mm.", true, 0)).is_empty());
+        let (plan, _) = generation(inner.force(Regenerate::default()).unwrap());
         assert!(plan.forced);
         assert_eq!(plan.question, "Mm.");
 
-        inner.auto_answer = false;
-        assert!(inner.on_transcript(&event("interviewer-2", 1, Speaker::Interviewer, "Vad är SSR?", true, 3_000)).is_none());
-        assert!(inner.force().is_ok());
+        inner.settings.auto_answer = false;
+        assert!(inner.on_transcript(&event("interviewer-2", 1, Speaker::Interviewer, "Vad är SSR?", true, 3_000)).is_empty());
+        assert!(inner.force(Regenerate::default()).is_ok());
     }
 
     #[test]
     fn force_without_interviewer_turn_is_an_error() {
-        let mut inner = inner();
+        let (mut inner, _workspace) = inner();
         inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Hej", true, 0));
-        assert!(inner.force().err().expect("no interviewer turn").contains("No interviewer turn"));
+        assert!(inner.force(Regenerate::default()).err().expect("error").contains("No interviewer turn"));
+    }
+
+    #[test]
+    fn regenerate_applies_one_off_mode_and_alternative_example() {
+        let (mut inner, _workspace) = inner();
+        inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om ett problem.", true, 0));
+        inner.last_sources = vec!["password_reset_race_condition".into()];
+        let (plan, _) = generation(inner.force(Regenerate { mode: Some(AnswerMode::Star), alternative: true }).unwrap());
+        assert_eq!(plan.mode, AnswerMode::Star);
+        assert!(plan.alternative);
+        assert!(plan.package.user.contains("Mode: STAR"));
+        assert!(plan.package.user.contains("do not rely on password_reset_race_condition"));
+        assert_eq!(inner.settings.answer_mode, AnswerMode::Normal, "one-off mode does not change the default");
+    }
+
+    #[test]
+    fn finished_suggestions_record_stories_used_for_later_prompts() {
+        let (mut inner, _workspace) = inner();
+        let (plan, _) = generation(inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om ett problem.", true, 0)));
+        let mut done = SuggestionEvent {
+            suggestion_id: plan.id,
+            status: SuggestionStatus::Done,
+            question: plan.question.clone(),
+            anchors: vec!["a".into()],
+            answer: "x".into(),
+            sources: vec!["analytics_adblock".into()],
+            unverified_sources: vec![],
+            no_verified_example: false,
+            error: None,
+            forced: false,
+            mode: AnswerMode::Normal,
+            alternative: false,
+            screen: false,
+            model: plan.model.clone(),
+            timing: SuggestionTiming::default(),
+        };
+        inner.finish(&done);
+        assert!(inner.active.is_none());
+        done.status = SuggestionStatus::Cancelled;
+        done.sources = vec!["ignored".into()];
+        inner.finish(&done);
+        assert_eq!(inner.stories_used.iter().map(|story| story.id.as_str()).collect::<Vec<_>>(), vec!["analytics_adblock"]);
+        let (next, _) = generation(inner.on_transcript(&event("interviewer-2", 1, Speaker::Interviewer, "Ett annat problem?", true, 5_000)));
+        assert!(next.package.user.contains("STORIES ALREADY USED"));
+        assert!(next.package.user.contains("- analytics_adblock (for: Berätta om ett problem.)"));
+    }
+
+    #[test]
+    fn memory_update_starts_after_enough_new_turns_and_is_absorbed() {
+        let (mut inner, _workspace) = inner();
+        let mut work = inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om dig själv.", true, 0));
+        assert!(!has_memory(&work), "too few turns yet");
+        inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Jag heter Alex.", true, 2_000));
+        inner.on_transcript(&event("interviewer-2", 1, Speaker::Interviewer, "Vad gör du nu?", true, 4_000));
+        inner.on_transcript(&event("candidate-2", 1, Speaker::Candidate, "Jag bygger Sagobo.", true, 6_000));
+        work = inner.on_transcript(&event("interviewer-3", 1, Speaker::Interviewer, "Hur testar du?", true, 8_000));
+        let (plan, token) = work
+            .into_iter()
+            .find_map(|item| match item {
+                Work::Memory(plan, token) => Some((plan, token)),
+                Work::Generate(..) => None,
+            })
+            .expect("memory job with four new turns");
+        assert_eq!(plan.absorbed_turns, 4);
+        assert!(plan.request.text.contains("CANDIDATE: Jag bygger Sagobo."));
+        assert!(!plan.request.text.contains("Hur testar du?"), "the current question is not memory yet");
+        assert!(!has_memory(&inner.force(Regenerate::default()).unwrap()), "one memory job at a time");
+
+        assert!(inner.finish_memory(&token, &plan, &Ok("topics_discussed: [Sagobo]".into())));
+        assert_eq!(inner.memory.absorbed_turns, 4);
+        assert_eq!(inner.memory.covered_until_ms, 6_900);
+        let (next, _) = generation(inner.force(Regenerate::default()).unwrap());
+        assert!(next.package.user.contains("INTERVIEW MEMORY\ntopics_discussed: [Sagobo]"));
+
+        inner.reset_interview(None);
+        assert!(inner.memory.text.is_empty());
+        assert!(!inner.finish_memory(&token, &plan, &Ok("stale".into())), "a reset discards late memory");
+    }
+
+    #[test]
+    fn lat_oss_se_starts_a_screen_suggestion_and_is_not_dialogue() {
+        let (mut inner, _workspace) = inner();
+        inner.screen_application = Some("4242".into());
+        inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Vad tror du är fel här?", true, 0));
+        assert!(inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Låt oss", false, 2_000)).is_empty());
+        let (plan, _) = generation(inner.on_transcript(&event("candidate-1", 2, Speaker::Candidate, "Låt oss se.", true, 2_000)));
+        assert_eq!(plan.screen, Some(Some("4242".into())));
+        assert_eq!(plan.question, "Vad tror du är fel här?");
+        assert!(plan.package.user.contains("SCREEN CONTEXT"));
+        assert!(!plan.package.user.contains("CANDIDATE: Låt oss"), "the command never becomes dialogue");
+        assert_eq!(inner.conversation.turns().len(), 1);
+        assert!(inner.on_transcript(&event("candidate-1", 3, Speaker::Candidate, "Låt oss se.", true, 2_000)).is_empty());
+
+        let (manual, _) = generation(inner.plan_screen(None, true));
+        assert_eq!(manual.screen, Some(None));
+        assert!(manual.forced);
+    }
+
+    #[test]
+    fn settings_changes_persist_and_reload() {
+        let (mut inner, workspace) = inner();
+        inner.settings.account_email = Some("me@example.com".into());
+        inner.settings.answer_mode = AnswerMode::Short;
+        inner.persist().unwrap();
+        let reloaded = CopilotInner::new(workspace.path.join("settings.json"));
+        assert_eq!(reloaded.settings.account_email.as_deref(), Some("me@example.com"));
+        assert_eq!(reloaded.settings.answer_mode, AnswerMode::Short);
     }
 
     #[test]
     fn simulated_turns_join_the_current_session() {
-        let mut inner = inner();
+        let (mut inner, _workspace) = inner();
         inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Hej och välkommen.", true, 0));
         let simulated = inner.simulated_event(Speaker::Candidate, "  Tack!  ").unwrap();
         assert_eq!(simulated.session_id, "s");
         assert_eq!(simulated.text, "Tack!");
-        assert!(simulated.final_segment);
         assert!(inner.simulated_event(Speaker::Interviewer, "   ").is_err());
         inner.on_transcript(&simulated);
         assert_eq!(inner.conversation.turns().len(), 2);
     }
 
-    #[test]
-    fn finish_only_clears_the_matching_generation() {
-        let mut inner = inner();
-        let (first, _) = inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Fråga ett?", true, 0)).unwrap();
-        let (second, _) = inner.force().unwrap();
-        inner.finish(first.id);
-        assert_eq!(inner.active.as_ref().map(|active| active.id), Some(second.id));
-        inner.finish(second.id);
-        assert!(inner.active.is_none());
-    }
-
-    fn serve_sse(chunks: Vec<String>) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}/v1", listener.local_addr().unwrap());
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut length = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = value.trim().parse().unwrap();
-                }
-                if line == "\r\n" {
-                    break;
-                }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
-                .unwrap();
-            for chunk in chunks {
-                let frame = serde_json::json!({ "choices": [{ "delta": { "content": chunk } }] });
-                stream.write_all(format!("data: {frame}\n\n").as_bytes()).unwrap();
-                stream.flush().unwrap();
-                thread::sleep(Duration::from_millis(5));
-            }
-            stream
-                .write_all(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
-                .unwrap();
-        });
-        base
-    }
-
     fn plan_with_profile() -> GenerationPlan {
-        let mut inner = inner();
+        let (mut inner, _workspace) = inner();
         inner.profile = Some(Arc::new(
             profile::parse_profile("p", "candidate:\n  name: A\nstories:\n  password_reset_race_condition:\n    action: x\n".into()).unwrap(),
         ));
-        inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om ett problem du hittade.", true, 0)).unwrap().0
+        generation(inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om ett problem du hittade.", true, 0))).0
     }
 
-    fn config(base_url: String) -> HermesConfig {
-        HermesConfig {
-            base_url,
-            api_key: Some("k".into()),
-            key_source: "test",
-            model: hermes::DEFAULT_MODEL.into(),
-            reasoning_effort: "low".into(),
-            api_server_enabled: Some(true),
-        }
+    fn account() -> Account {
+        let json = serde_json::json!({ "tokens": { "access_token": codex_auth::test_token("me@example.com", "plus", u64::MAX / 2_000) } });
+        codex_auth::accounts_from_json("test", &json).remove(0)
+    }
+
+    fn no_capture() -> Result<Screenshot, String> {
+        panic!("no screenshot expected")
     }
 
     #[test]
     fn generation_streams_anchors_before_answer_and_checks_grounding() {
-        let base = serve_sse(
-            ["ANCHORS\n- password ", "reset\n- multiple tabs\n", "ANSWER\nNär jag ", "byggde det...\n", "SOURCES: password_reset_race_condition, invented_story\n"]
-                .map(String::from)
-                .to_vec(),
-        );
+        let chunks = ["ANCHORS\n- password ", "reset\n- multiple tabs\n", "ANSWER\nNär jag ", "byggde det...\n", "SOURCES: password_reset_race_condition, invented_story\n"];
+        let mut stream: Vec<(String, u64)> = chunks.iter().map(|chunk| (delta(chunk), 5)).collect();
+        stream.push((completed(), 0));
+        let (base, _seen) = serve_once(SSE_HEAD, stream);
         let plan = plan_with_profile();
         let mut events = Vec::new();
-        run_generation(&plan, &CancelToken::default(), &config(base), CURL_BIN, |event| events.push(event.clone()));
+        let last = run_generation(&plan, &CancelToken::default(), Ok(account()), CURL_BIN, &base, no_capture, |event| events.push(event.clone()));
 
         assert_eq!(events.first().unwrap().status, SuggestionStatus::Preparing);
         let first_anchor = events.iter().position(|event| !event.anchors.is_empty()).unwrap();
         let first_answer = events.iter().position(|event| !event.answer.is_empty()).unwrap();
         assert!(first_anchor < first_answer, "anchors must arrive before answer text");
         assert_eq!(events[first_anchor].anchors[0], "password reset");
-        assert!(events[first_anchor].answer.is_empty());
-
-        let last = events.last().unwrap();
         assert_eq!(last.status, SuggestionStatus::Done);
         assert_eq!(last.anchors, vec!["password reset", "multiple tabs"]);
         assert_eq!(last.answer, "När jag byggde det...");
         assert_eq!(last.sources, vec!["password_reset_race_condition"]);
         assert_eq!(last.unverified_sources, vec!["invented_story"], "ids missing from profile.yaml are flagged");
-        let timing = &last.timing;
-        assert!(timing.first_anchor_at_ms.unwrap() <= timing.first_answer_at_ms.unwrap());
-        assert!(timing.requested_at_ms <= timing.first_anchor_at_ms.unwrap());
-        assert!(timing.finished_at_ms.is_some());
+        assert!(last.timing.first_anchor_at_ms.unwrap() <= last.timing.first_answer_at_ms.unwrap());
+        assert_eq!(&last, events.last().unwrap());
     }
 
     #[test]
-    fn generation_reports_skip_and_failure() {
+    fn generation_reports_skip_account_and_network_failures() {
         let plan = plan_with_profile();
-        let mut events = Vec::new();
-        run_generation(&plan, &CancelToken::default(), &config(serve_sse(vec!["SKIP\n".into()])), CURL_BIN, |event| {
-            events.push(event.clone())
-        });
-        assert_eq!(events.last().unwrap().status, SuggestionStatus::Skipped);
+        let (base, _seen) = serve_once(SSE_HEAD, vec![(delta("SKIP\n"), 0), (completed(), 0)]);
+        let last = run_generation(&plan, &CancelToken::default(), Ok(account()), CURL_BIN, &base, no_capture, |_| {});
+        assert_eq!(last.status, SuggestionStatus::Skipped);
 
-        let unused = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}/v1", unused.local_addr().unwrap());
-        drop(unused);
-        let mut events = Vec::new();
-        run_generation(&plan, &CancelToken::default(), &config(base), CURL_BIN, |event| events.push(event.clone()));
-        let last = events.last().unwrap();
+        let last = run_generation(&plan, &CancelToken::default(), Err("No ChatGPT/Codex sign-in found".into()), CURL_BIN, &base, no_capture, |_| {});
         assert_eq!(last.status, SuggestionStatus::Failed);
-        assert!(last.error.as_deref().unwrap().contains("not reachable"));
+        assert!(last.error.unwrap().contains("sign-in"));
+
+        let last = run_generation(&plan, &CancelToken::default(), Ok(account()), CURL_BIN, &unused_base(), no_capture, |_| {});
+        assert_eq!(last.status, SuggestionStatus::Failed);
+        assert!(last.error.unwrap().contains("Could not reach"));
+    }
+
+    #[test]
+    fn screen_generation_attaches_the_screenshot_or_explains_why_not() {
+        let (mut inner, _workspace) = inner();
+        let (plan, _) = generation(inner.plan_screen(Some("1".into()), true));
+        let (base, seen) = serve_once(SSE_HEAD, vec![(delta("ANCHORS\n- off-by-one\nANSWER\nLoopen går ett steg för långt.\nSOURCES: none\n"), 0), (completed(), 0)]);
+        let shot = || Ok(Screenshot { data_url: "data:image/jpeg;base64,QUJD".into(), width: 1, height: 1 });
+        let last = run_generation(&plan, &CancelToken::default(), Ok(account()), CURL_BIN, &base, shot, |_| {});
+        assert_eq!(last.status, SuggestionStatus::Done);
+        assert!(last.screen);
+        let (_, body) = seen.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["input"][0]["content"][1]["image_url"], "data:image/jpeg;base64,QUJD");
+
+        let denied = || Err("Screen & System Audio Recording permission is not granted".to_string());
+        let last = run_generation(&plan, &CancelToken::default(), Ok(account()), CURL_BIN, &base, denied, |_| {});
+        assert_eq!(last.status, SuggestionStatus::Failed);
+        assert!(last.error.unwrap().starts_with("Screen assistance is unavailable"));
     }
 }

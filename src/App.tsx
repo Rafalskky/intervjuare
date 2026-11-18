@@ -341,7 +341,8 @@ function App() {
               notice={copilot.view.notice}
               stale={suggestionStale}
               canForce={hasInterviewerTurn}
-              onForce={() => void copilot.forceAnswer()}
+              onForce={(mode, alternative) => void copilot.forceAnswer(mode, alternative)}
+              onCaptureScreen={() => void copilot.captureScreen(applicationId)}
               onCancel={() => void copilot.cancelSuggestion()}
             />
           )}
@@ -358,7 +359,7 @@ function App() {
                 <article key={segment.segmentId} className={`rounded-xl border p-4 ${segment.speaker === 'interviewer' ? 'border-sky-400/15 bg-sky-400/5' : 'border-emerald-400/15 bg-emerald-400/5'}`}>
                   <div className="flex items-center justify-between text-xs uppercase tracking-wider">
                     <span className={segment.speaker === 'interviewer' ? 'text-sky-300' : 'text-emerald-300'}>{segment.speaker === 'interviewer' ? 'Interviewer' : 'Me'}</span>
-                    <span className="text-stone-500">{segment.segmentId.startsWith('simulated-') ? 'simulated' : `${segment.finalSegment ? 'final' : `partial · r${segment.revision}`} · ${segment.latencyMs} ms`}</span>
+                    <span className="text-stone-500">{copilot.commandSegments.includes(segment.segmentId) ? 'command · screen' : segment.segmentId.startsWith('simulated-') ? 'simulated' : `${segment.finalSegment ? 'final' : `partial · r${segment.revision}`} · ${segment.latencyMs} ms`}</span>
                   </div>
                   <p className="mt-2 text-lg leading-7 text-stone-100">{segment.text}</p>
                 </article>

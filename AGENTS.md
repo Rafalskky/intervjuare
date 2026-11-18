@@ -10,7 +10,7 @@ Read `README.md` before making architectural or product decisions. `README.md` i
 
 Intervjuare is a **private, personal, macOS-only AI interview copilot**.
 
-The application listens to online interviews, transcribes candidate and interviewer audio separately, maintains interview context, sends relevant context to Hermes, and displays fast speaking anchors followed by a streaming full answer.
+The application listens to online interviews, transcribes candidate and interviewer audio separately, maintains interview context, sends relevant context to the model, and displays fast speaking anchors followed by a streaming full answer.
 
 The project is not a SaaS product and should not be engineered as one.
 
@@ -32,9 +32,10 @@ These constraints are intentional and must be preserved unless the owner explici
 
 ### AI runtime
 
-- Runtime AI is provided through **Hermes**.
-- Do not make a paid direct model API the primary architecture.
-- Do not replace Hermes with OpenAI API, Anthropic API, Gemini API, or another direct cloud provider unless explicitly requested.
+- Runtime AI is the owner's **ChatGPT subscription**, called directly through the Codex backend (`chatgpt.com/backend-api/codex`) with the ChatGPT sign-in that already exists on the Mac. *(Owner decision 2026-11-18; this replaced Hermes.)*
+- Do not require Hermes or another agent runtime at run time.
+- Do not switch to a paid API-key provider (OpenAI API, Anthropic API, Gemini API, …) unless explicitly requested.
+- Use only the account the owner chose. Never fall back to another account, never refresh, rewrite or copy another tool's OAuth tokens, and never log, display or pass tokens in process arguments.
 - Do not build or require a large local LLM.
 
 ### Candidate data
@@ -77,7 +78,7 @@ macOS bridge    Swift
 STT             whisper.cpp
 Storage         SQLite
 Profile         YAML
-Runtime AI      Hermes
+Runtime AI      ChatGPT subscription (Codex backend)
 ```
 
 A proposed change to one of these core technologies must include a concrete reason and trade-off analysis before implementation.
@@ -113,7 +114,7 @@ Responsible for:
 - interview state;
 - transcript buffers;
 - context assembly;
-- Hermes communication;
+- model communication;
 - persistence coordination;
 - commands exposed to the UI;
 - cancellation and lifecycle management.
@@ -136,7 +137,7 @@ Responsible for local speech-to-text.
 
 Do not mix AI reasoning with STT.
 
-### Hermes
+### Model (ChatGPT)
 
 Responsible for semantic reasoning:
 
@@ -226,7 +227,7 @@ The exact schema may evolve, but progressive delivery is mandatory.
 
 Never reduce the AI request to only the latest interviewer sentence.
 
-Hermes should receive the relevant combination of:
+The model should receive the relevant combination of:
 
 ```text
 system rules
@@ -312,7 +313,7 @@ These are commands, not normal interview content.
 
 They should trigger the screenshot-assistance flow and should not be inserted into the candidate/interviewer conversation transcript sent as ordinary dialogue.
 
-Do not send these commands to Hermes merely to decide whether they are commands when a deterministic local matcher is sufficient.
+Do not send these commands to the model merely to decide whether they are commands when a deterministic local matcher is sufficient.
 
 ---
 
@@ -334,13 +335,13 @@ Screenshots should be treated as temporary context by default.
 
 Do not automatically persist screenshots unless the owner explicitly asks for that behavior.
 
-When screen context is supplied to Hermes, combine it with the relevant interview context rather than treating the image as an isolated request.
+When screen context is supplied to the model, combine it with the relevant interview context rather than treating the image as an isolated request.
 
 ---
 
 ## 12. Internet Use
 
-Hermes may use current web information when needed.
+The model may use current web information when needed.
 
 Do not put web search into every answer path.
 
@@ -446,7 +447,7 @@ Live interviews require graceful degradation.
 
 Examples:
 
-### Hermes unavailable
+### Model unavailable (offline, expired sign-in, usage limit)
 
 The application should remain stable and continue transcription if possible.
 
@@ -472,7 +473,7 @@ Do not turn recoverable failures into application-wide crashes.
 
 ## 18. Do Not Over-Engineer Retrieval
 
-For the first version, sending the complete `profile.yaml` to Hermes is acceptable.
+For the first version, sending the complete `profile.yaml` to the model is acceptable.
 
 Do not introduce:
 
@@ -499,7 +500,7 @@ request 3 → generate answer
 
 unless measurements prove that separation is necessary.
 
-Prefer a single Hermes reasoning request that can understand the context, select the relevant experience, emit anchors first, and then stream the full answer.
+Prefer a single model request that can understand the context, select the relevant experience, emit anchors first, and then stream the full answer.
 
 ---
 
@@ -517,7 +518,7 @@ Do not implement live AI answering until this works well.
 
 ### Milestone 2
 
-Hermes integration + speaking anchors.
+Model integration + speaking anchors.
 
 ### Milestone 3
 
@@ -601,7 +602,7 @@ Relevant docs may include:
 README.md
 docs/architecture.md
 docs/audio-pipeline.md
-docs/hermes.md
+docs/model-runtime.md
 docs/context-management.md
 docs/profile-format.md
 docs/latency.md

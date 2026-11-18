@@ -112,6 +112,11 @@ impl Conversation {
         }
     }
 
+    /// Drops a segment entirely (an explicit voice command is not dialogue).
+    pub fn remove_segment(&mut self, segment_id: &str) {
+        self.segments.retain(|segment| segment.id != segment_id);
+    }
+
     pub fn turns(&self) -> Vec<Turn> {
         let mut turns: Vec<Turn> = Vec::new();
         for segment in &self.segments {
@@ -162,10 +167,10 @@ fn normalize_whitespace(text: &str) -> String {
 }
 
 /// Single-word acknowledgements that never expect an answer. This is a
-/// deterministic filter for non-content tokens only, so an automatic Hermes
+/// deterministic filter for non-content tokens only, so an automatic model
 /// request is not spent on "Mm." while the candidate is talking. Anything
 /// longer, and any real one-word question such as "Varför?", still goes to
-/// Hermes, which decides whether an answer is expected.
+/// the model, which decides whether an answer is expected.
 pub fn is_backchannel(text: &str) -> bool {
     const BACKCHANNELS: [&str; 24] = [
         "mm", "mhm", "mmm", "hm", "ja", "jaa", "jo", "japp", "okej", "ok", "okay", "aha", "jaha", "precis",
@@ -302,6 +307,17 @@ mod tests {
         }
         assert_eq!(conversation.segments.len(), MAX_SEGMENTS);
         assert_eq!(conversation.segments[0].id, "seg-10");
+    }
+
+    #[test]
+    fn removed_segments_leave_no_trace_in_turns() {
+        let mut conversation = Conversation::default();
+        conversation.apply(&event("s", "interviewer-1", 1, Speaker::Interviewer, "Titta på koden.", true, 0));
+        conversation.apply(&event("s", "candidate-1", 1, Speaker::Candidate, "Låt oss se", false, 2_000));
+        conversation.remove_segment("candidate-1");
+        let turns = conversation.turns();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].speaker, Speaker::Interviewer);
     }
 
     #[test]

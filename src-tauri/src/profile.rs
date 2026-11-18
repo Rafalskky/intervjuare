@@ -1,6 +1,6 @@
 //! Loading and validation of the canonical candidate profile (`profile.yaml`).
 //!
-//! The raw YAML text is what Hermes receives (sending the whole profile is the
+//! The raw YAML text is what the model receives (sending the whole profile is the
 //! intended first version). Parsing here only validates the file and extracts
 //! the profile ids that a suggestion may cite, so citations can be checked
 //! against real profile entries.
@@ -182,7 +182,7 @@ stories:
         assert!(profile.summary.warnings.is_empty(), "{:?}", profile.summary.warnings);
         assert!(profile.citable_ids.contains("sagobo"));
         assert!(profile.citable_ids.contains("analytics_adblock"));
-        assert_eq!(profile.raw, SAMPLE, "Hermes receives the unmodified text");
+        assert_eq!(profile.raw, SAMPLE, "the model receives the unmodified text");
     }
 
     #[test]

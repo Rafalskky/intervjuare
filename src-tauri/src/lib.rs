@@ -13,6 +13,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+
+mod context;
+mod conversation;
+mod copilot;
+mod hermes;
+mod profile;
+mod suggestion;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 
@@ -2175,6 +2182,7 @@ fn spawn_dispatcher(
             )
         };
         let emit = |event: TranscriptEvent| {
+            copilot::on_transcript(&app, &event);
             let _ = app.emit(TRANSCRIPT_EVENT, event);
         };
         let warn = |code: &str, message: String, source: Option<Speaker>| {
@@ -7303,11 +7311,21 @@ pub fn run() {
     let exit_runtime = runtime.clone();
     tauri::Builder::default()
         .manage(runtime)
+        .manage(copilot::Copilot::new())
         .invoke_handler(tauri::generate_handler![
             list_audio_sources,
             request_screen_capture_permission,
             start_audio_capture,
-            stop_audio_capture
+            stop_audio_capture,
+            copilot::copilot_status,
+            copilot::load_candidate_profile,
+            copilot::set_job_context,
+            copilot::set_auto_answer,
+            copilot::check_hermes,
+            copilot::force_answer,
+            copilot::submit_test_turn,
+            copilot::clear_conversation,
+            copilot::cancel_suggestion
         ])
         .on_window_event(move |window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {

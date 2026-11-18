@@ -1408,11 +1408,16 @@ cmake --build vendor/whisper.cpp/build -j --target whisper-server
 # 3. Multilingual Whisper model (~574 MB) into assets/models/
 sh vendor/whisper.cpp/models/download-ggml-model.sh large-v3-turbo-q5_0 assets/models
 
-# 4. Build a signed debug bundle (a persistent signing identity keeps macOS permissions stable)
+# 4. Candidate profile (ignored by Git) — then edit it with your real experience
+cp profile.example.yaml profile.yaml
+
+# 5. Build a signed debug bundle (a persistent signing identity keeps macOS permissions stable)
 INTERVJUARE_CODESIGN_IDENTITY="<identity from: security find-identity -v -p codesigning>" npm run bundle:stable
 ```
 
-See `docs/audio-pipeline.md` ("Stable permissions across rebuilds") for signing details.
+See `docs/audio-pipeline.md` ("Stable permissions across rebuilds") for signing details, `docs/hermes.md` for enabling the Hermes API server, `docs/profile-format.md` for the profile, and `docs/context-management.md` for how interview turns trigger suggestions.
+
+Without audio, the copilot can be tried with **Test without audio**: typed interviewer/candidate turns take the same conversation and Hermes path as transcribed speech.
 
 ---
 

@@ -1,0 +1,80 @@
+# Example candidate profile for Intervjuare.
+#
+# Copy to `profile.yaml` (ignored by Git) and replace everything with your own
+# real experience. Hermes may only make personal claims that are grounded in
+# this file, so write down what actually happened, not what sounds good.
+#
+# Keys under `projects` and `stories` are ids. Suggestions cite them, and the
+# app flags any cited id that does not exist here. See docs/profile-format.md.
+
+candidate:
+  name: Alex Example
+
+languages:
+  interview:
+    - sv
+    - en
+
+skills:
+  frontend:
+    - React
+    - TypeScript
+    - Next.js
+  testing:
+    - Jest
+    - React Testing Library
+
+projects:
+  sagobo:
+    type: personal_project
+    description: >
+      Personalized children's story application.
+    areas:
+      frontend:
+        - React
+        - Next.js
+      backend:
+        - authentication
+        - APIs
+        - password reset
+        - validation
+      design:
+        - user flows
+        - onboarding
+      product:
+        - monetization
+        - positioning
+
+stories:
+  analytics_adblock:
+    project: work
+    tags: [initiative, analytics, problem_solving, privacy, business]
+    situation: >
+      Google Analytics was being implemented on the website.
+    problem: >
+      Ad blockers could block analytics even for users who had consented
+      to data collection.
+    action: >
+      A solution was designed to improve analytics reliability while
+      continuing to respect user consent.
+    result: >
+      More reliable data for business decisions without collecting analytics
+      from users who had declined tracking.
+
+  password_reset_race_condition:
+    project: sagobo
+    tags: [backend, security, debugging, testing, initiative]
+    situation: >
+      Password reset functionality was implemented.
+    problem: >
+      Multiple reset requests could be triggered quickly, including from
+      multiple browser tabs.
+    action: >
+      Server-side protection was added so that repeated requests could not
+      bypass the intended cooldown logic.
+    testing: >
+      Jest tests simulated repeated user actions and multiple requests.
+    lessons:
+      - server-side protection matters
+      - client-side state is not sufficient
+      - race conditions need to be considered

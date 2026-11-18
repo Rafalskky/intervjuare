@@ -10,6 +10,11 @@ import {
   screenPermissionFollowupMessage,
   shouldShowScreenPermissionAction,
 } from './screenPermission'
+import { CopilotSetup } from './CopilotSetup'
+import { SuggestionPanel } from './SuggestionPanel'
+import { isSuggestionStale } from './suggestionView'
+import { useCopilot } from './useCopilot'
+import type { Speaker as CopilotSpeaker } from './copilotTypes'
 
 type CaptureSource = { id: string; name: string; bundleId?: string }
 type SourceDiscoveryError = { code: string; message: string }
@@ -96,6 +101,17 @@ function App() {
     [segments],
   )
 
+  const copilot = useCopilot<TranscriptEvent>(nativeBackendAvailable, language)
+  const suggestionStale = isSuggestionStale(copilot.view.shown, transcript)
+  const hasInterviewerTurn = transcript.some((segment) => segment.speaker === 'interviewer')
+
+  // Simulated turns bypass the capture session gate: Rust returns the
+  // synthetic final segment, and it is shown like a transcribed one.
+  async function addTestTurn(speaker: CopilotSpeaker, text: string) {
+    const event = await copilot.submitTestTurn(speaker, text)
+    if (event) setSegments((current) => ({ ...current, [event.segmentId]: event }))
+  }
+
   const refreshSources = useCallback(async () => {
     if (!nativeBackendAvailable) return
     setLoading(true)
@@ -120,6 +136,8 @@ function App() {
     setWarning(null)
     setTerminalWarning(null)
     setSegments({})
+    // A new capture session is a new interview: drop simulated/old turns.
+    await copilot.clearConversation()
     sessionGate.gate.beginStart()
     setCaptureState({ sessionId: '', state: 'starting', message: 'Starting capture…' })
     try {
@@ -241,8 +259,8 @@ function App() {
       <div className="mx-auto max-w-6xl">
         <header className="mb-6 flex items-center justify-between border-b border-white/10 pb-5">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.26em] text-emerald-300">Milestone 1</p>
-            <h1 className="mt-1 text-3xl font-semibold">Live transcript</h1>
+            <p className="text-xs font-semibold uppercase tracking-[0.26em] text-emerald-300">Milestone 2</p>
+            <h1 className="mt-1 text-3xl font-semibold">Interview copilot</h1>
           </div>
           <span className={`rounded-full px-4 py-2 text-sm ${running ? 'bg-red-400/15 text-red-200' : 'bg-white/5 text-stone-400'}`}>
             {captureState.state === 'capturing' ? '● LIVE' : captureState.state.toUpperCase()}
@@ -250,6 +268,7 @@ function App() {
         </header>
 
         <section className="grid gap-5 lg:grid-cols-[340px_1fr]">
+          <div>
           <aside className="rounded-2xl border border-white/10 bg-[#11151b] p-5">
             <h2 className="text-lg font-medium">Audio setup</h2>
             <p className="mt-2 text-sm leading-6 text-stone-400">
@@ -312,8 +331,21 @@ function App() {
             <p className="mt-3 text-xs leading-5 text-stone-400">Application audio is captured at app level, not from one isolated browser tab. Avoid unrelated audio in the selected browser while the interview is running.</p>
             <p className="mt-3 text-xs leading-5 text-amber-200/80">Use headphones when possible. Source separation cannot prevent acoustic echo or meeting-app sidetone.</p>
           </aside>
+          {nativeBackendAvailable && <CopilotSetup copilot={copilot} language={language} onTestTurn={addTestTurn} />}
+          </div>
 
-          <section className="min-h-[560px] rounded-2xl border border-white/10 bg-[#11151b] p-6">
+          <div className="space-y-5">
+          {nativeBackendAvailable && (
+            <SuggestionPanel
+              shown={copilot.view.shown}
+              notice={copilot.view.notice}
+              stale={suggestionStale}
+              canForce={hasInterviewerTurn}
+              onForce={() => void copilot.forceAnswer()}
+              onCancel={() => void copilot.cancelSuggestion()}
+            />
+          )}
+          <section className="min-h-[320px] rounded-2xl border border-white/10 bg-[#11151b] p-6">
             {terminalWarning && <div role="alert" className="mb-5 rounded-xl border border-red-300/25 bg-red-400/10 p-4 text-sm leading-6 text-red-100"><strong>{terminalWarning.code}</strong><br />{terminalWarning.message}</div>}
             {!terminalWarning && warning && <div role="alert" className="mb-5 rounded-xl border border-amber-300/20 bg-amber-300/10 p-4 text-sm leading-6 text-amber-100"><strong>{warning.code}</strong><br />{warning.message}</div>}
             <div className="flex items-center justify-between">
@@ -326,13 +358,14 @@ function App() {
                 <article key={segment.segmentId} className={`rounded-xl border p-4 ${segment.speaker === 'interviewer' ? 'border-sky-400/15 bg-sky-400/5' : 'border-emerald-400/15 bg-emerald-400/5'}`}>
                   <div className="flex items-center justify-between text-xs uppercase tracking-wider">
                     <span className={segment.speaker === 'interviewer' ? 'text-sky-300' : 'text-emerald-300'}>{segment.speaker === 'interviewer' ? 'Interviewer' : 'Me'}</span>
-                    <span className="text-stone-500">{segment.finalSegment ? 'final' : `partial · r${segment.revision}`} · {segment.latencyMs} ms</span>
+                    <span className="text-stone-500">{segment.segmentId.startsWith('simulated-') ? 'simulated' : `${segment.finalSegment ? 'final' : `partial · r${segment.revision}`} · ${segment.latencyMs} ms`}</span>
                   </div>
                   <p className="mt-2 text-lg leading-7 text-stone-100">{segment.text}</p>
                 </article>
               ))}
             </div>
           </section>
+          </div>
         </section>
       </div>
     </main>

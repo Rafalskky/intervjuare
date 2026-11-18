@@ -15,6 +15,7 @@
 //!   a screen-aware suggestion and is removed from the dialogue.
 
 use crate::{
+    analysis,
     codex_auth::{self, Account, AccountSummary},
     context::{self, AnswerMode, AnswerOptions, ContextPackage, JobContext, UsedStory},
     conversation::{self, Conversation, Turn, Update},
@@ -39,6 +40,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 pub const SUGGESTION_EVENT: &str = "suggestion-event";
 pub const MEMORY_EVENT: &str = "memory-event";
 pub const VOICE_COMMAND_EVENT: &str = "voice-command";
+pub const ANALYSIS_EVENT: &str = "analysis-event";
 const MAX_TEST_TURN_CHARS: usize = 2_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -144,6 +146,7 @@ struct CopilotInner {
     last_sources: Vec<String>,
     command_segments: HashSet<String>,
     screen_application: Option<String>,
+    analysis: Option<(u64, Arc<CancelToken>)>,
 }
 
 impl CopilotInner {
@@ -167,6 +170,7 @@ impl CopilotInner {
             last_sources: Vec::new(),
             command_segments: HashSet::new(),
             screen_application: None,
+            analysis: None,
         };
         let _ = inner.load_profile(profile_path);
         inner
@@ -205,6 +209,9 @@ impl CopilotInner {
     /// A new interview: forget everything learned about the previous one.
     fn reset_interview(&mut self, session_id: Option<String>) {
         self.cancel_active();
+        if let Some((_, analysis)) = self.analysis.take() {
+            analysis.cancel();
+        }
         if let Some(job) = self.memory_job.take() {
             job.cancel();
         }
@@ -368,6 +375,31 @@ impl CopilotInner {
             self.memory.absorbed_turns += plan.absorbed_turns;
         }
         true
+    }
+
+    /// Post-interview report request from everything known about this interview.
+    fn plan_analysis(&mut self, report_language: Option<String>) -> Result<(u64, ModelRequest, Arc<CancelToken>, Option<String>), String> {
+        if let Some(language) = report_language.filter(|language| matches!(language.as_str(), "pl" | "sv" | "en")) {
+            self.settings.report_language = language;
+        }
+        let request = analysis::build_request(
+            &self.settings.job,
+            self.profile.as_deref(),
+            &self.memory.text,
+            &self.stories_used,
+            &self.conversation.turns(),
+            &self.settings.report_language,
+            self.settings.analysis_model(),
+            &self.settings.reasoning_effort,
+        )?;
+        if let Some((_, previous)) = self.analysis.take() {
+            previous.cancel();
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let token = Arc::new(CancelToken::default());
+        self.analysis = Some((id, token.clone()));
+        Ok((id, request, token, self.settings.account_email.clone()))
     }
 
     fn simulated_event(&mut self, speaker: Speaker, text: &str) -> Result<TranscriptEvent, String> {
@@ -602,6 +634,71 @@ fn apply_parsed(event: &mut SuggestionEvent, parsed: ParsedSuggestion) -> bool {
     changed
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnalysisStatus {
+    Running,
+    Done,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisEvent {
+    pub analysis_id: u64,
+    pub status: AnalysisStatus,
+    pub text: String,
+    pub error: Option<String>,
+    pub model: String,
+}
+
+/// Streams the post-interview report; emits at most every ~150 ms of
+/// new text so a long report does not flood the UI.
+fn run_analysis(
+    id: u64,
+    request: &ModelRequest,
+    token: &CancelToken,
+    account: Result<Account, String>,
+    curl_bin: &str,
+    base_url: &str,
+    mut emit: impl FnMut(&AnalysisEvent),
+) -> AnalysisEvent {
+    let mut event = AnalysisEvent { analysis_id: id, status: AnalysisStatus::Running, text: String::new(), error: None, model: request.model.clone() };
+    emit(&event);
+    let account = match account {
+        Ok(account) => account,
+        Err(error) => {
+            event.status = AnalysisStatus::Failed;
+            event.error = Some(error);
+            emit(&event);
+            return event;
+        }
+    };
+    let mut last_emit = Instant::now();
+    let result = llm::stream_response(&account, request, token, curl_bin, base_url, |delta| {
+        event.text.push_str(delta);
+        if last_emit.elapsed().as_millis() >= 150 {
+            last_emit = Instant::now();
+            emit(&event);
+        }
+    });
+    event.status = match result {
+        Ok(StreamOutcome::Completed { .. }) if event.text.trim().is_empty() => {
+            event.error = Some("The model returned an empty report.".into());
+            AnalysisStatus::Failed
+        }
+        Ok(StreamOutcome::Completed { .. }) => AnalysisStatus::Done,
+        Ok(StreamOutcome::Cancelled) => AnalysisStatus::Cancelled,
+        Err(error) => {
+            event.error = Some(error);
+            AnalysisStatus::Failed
+        }
+    };
+    emit(&event);
+    event
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotStatus {
@@ -760,6 +857,60 @@ pub fn submit_test_turn(app: AppHandle, copilot: State<'_, Copilot>, speaker: Sp
     }
     dispatch(&app, &copilot.0, work);
     Ok(event)
+}
+
+/// Starts the post-interview report for the current conversation.
+#[tauri::command]
+pub fn analyze_interview(app: AppHandle, copilot: State<'_, Copilot>, report_language: Option<String>) -> Result<u64, String> {
+    let (id, request, token, email) = {
+        let mut inner = copilot.lock()?;
+        let planned = inner.plan_analysis(report_language)?;
+        let _ = inner.persist();
+        planned
+    };
+    let state = copilot.0.clone();
+    thread::spawn(move || {
+        let account = resolve_account(email.as_deref());
+        run_analysis(id, &request, &token, account, CURL_BIN, &llm::base_url(), |event| {
+            let _ = app.emit(ANALYSIS_EVENT, event);
+        });
+        if let Ok(mut inner) = state.lock() {
+            if inner.analysis.as_ref().is_some_and(|(current, _)| *current == id) {
+                inner.analysis = None;
+            }
+        }
+    });
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn cancel_analysis(copilot: State<'_, Copilot>) -> Result<(), String> {
+    if let Some((_, token)) = copilot.lock()?.analysis.take() {
+        token.cancel();
+    }
+    Ok(())
+}
+
+/// Saves a finished report as Markdown in the local reports folder. Only
+/// on explicit owner action; returns the file path.
+#[tauri::command]
+pub fn save_analysis_report(copilot: State<'_, Copilot>, text: String) -> Result<String, String> {
+    let (dir, filename) = {
+        let inner = copilot.lock()?;
+        (analysis::reports_dir(&inner.settings_path), analysis::report_filename(&inner.settings.job.company, now_ms()))
+    };
+    analysis::save_report(&dir, &filename, &text).map(|path| path.display().to_string())
+}
+
+#[tauri::command]
+pub fn set_report_settings(copilot: State<'_, Copilot>, report_language: String, analysis_model: String) -> Result<(), String> {
+    if !matches!(report_language.as_str(), "pl" | "sv" | "en") {
+        return Err("Report language must be pl, sv or en.".into());
+    }
+    let mut inner = copilot.lock()?;
+    inner.settings.report_language = report_language;
+    inner.settings.analysis_model = analysis_model.trim().to_string();
+    inner.persist()
 }
 
 #[tauri::command]
@@ -971,6 +1122,50 @@ mod tests {
         let (manual, _) = generation(inner.plan_screen(None, true));
         assert_eq!(manual.screen, Some(None));
         assert!(manual.forced);
+    }
+
+    #[test]
+    fn analysis_uses_the_whole_interview_and_supersedes_older_reports() {
+        let (mut inner, _workspace) = inner();
+        assert!(inner.plan_analysis(None).err().expect("empty").contains("Nothing to analyse"));
+        inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om dig själv.", true, 0));
+        inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Jag heter Alex.", true, 2_000));
+        inner.memory.text = "topics_discussed: [intro]".into();
+        let (first_id, request, first_token, _) = inner.plan_analysis(Some("sv".into())).unwrap();
+        assert_eq!(inner.settings.report_language, "sv");
+        assert!(request.text.starts_with("REPORT LANGUAGE\nSwedish"));
+        assert!(request.text.contains("CANDIDATE: Jag heter Alex."));
+        assert!(request.text.contains("topics_discussed: [intro]"));
+        assert_eq!(request.model, "gpt-6-luna");
+        let (second_id, _, _, _) = inner.plan_analysis(Some("xx".into())).unwrap();
+        assert!(first_token.is_cancelled(), "a new report supersedes the running one");
+        assert!(second_id > first_id);
+        assert_eq!(inner.settings.report_language, "sv", "invalid language is ignored");
+        inner.reset_interview(None);
+        assert!(inner.analysis.is_none());
+    }
+
+    #[test]
+    fn analysis_streams_the_report_and_reports_failures() {
+        let (base, _seen) = serve_once(SSE_HEAD, vec![(delta("## Summary\n"), 0), (delta("Bra intervju."), 200), (completed(), 0)]);
+        let request = ModelRequest {
+            model: "gpt-test".into(),
+            reasoning_effort: "none".into(),
+            instructions: analysis::ANALYSIS_INSTRUCTIONS.into(),
+            text: "TRANSCRIPT\nx".into(),
+            image_data_url: None,
+            cache_key: None,
+        };
+        let mut events = Vec::new();
+        let last = run_analysis(7, &request, &CancelToken::default(), Ok(account()), CURL_BIN, &base, |event| events.push(event.clone()));
+        assert_eq!(events.first().unwrap().status, AnalysisStatus::Running);
+        assert_eq!(last.status, AnalysisStatus::Done);
+        assert_eq!(last.text, "## Summary\nBra intervju.");
+        assert_eq!(&last, events.last().unwrap());
+
+        let last = run_analysis(8, &request, &CancelToken::default(), Err("No ChatGPT/Codex sign-in found".into()), CURL_BIN, &base, |_| {});
+        assert_eq!(last.status, AnalysisStatus::Failed);
+        assert!(last.error.unwrap().contains("sign-in"));
     }
 
     #[test]

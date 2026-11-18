@@ -58,6 +58,18 @@ export type Settings = {
   job: JobContext
   autoAnswer: boolean
   answerMode: AnswerMode
+  reportLanguage: ReportLanguage
+  analysisModel: string
+}
+
+export type ReportLanguage = 'pl' | 'sv' | 'en'
+
+export type AnalysisEvent = {
+  analysisId: number
+  status: 'running' | 'done' | 'cancelled' | 'failed'
+  text: string
+  error: string | null
+  model: string
 }
 
 export type AccountSummary = {

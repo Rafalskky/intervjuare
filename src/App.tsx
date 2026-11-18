@@ -10,6 +10,7 @@ import {
   screenPermissionFollowupMessage,
   shouldShowScreenPermissionAction,
 } from './screenPermission'
+import { AnalysisPanel } from './AnalysisPanel'
 import { CopilotSetup } from './CopilotSetup'
 import { SuggestionPanel } from './SuggestionPanel'
 import { isSuggestionStale } from './suggestionView'
@@ -259,7 +260,7 @@ function App() {
       <div className="mx-auto max-w-6xl">
         <header className="mb-6 flex items-center justify-between border-b border-white/10 pb-5">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.26em] text-emerald-300">Milestone 2</p>
+            <p className="text-xs font-semibold uppercase tracking-[0.26em] text-emerald-300">Milestones 1–6</p>
             <h1 className="mt-1 text-3xl font-semibold">Interview copilot</h1>
           </div>
           <span className={`rounded-full px-4 py-2 text-sm ${running ? 'bg-red-400/15 text-red-200' : 'bg-white/5 text-stone-400'}`}>
@@ -366,6 +367,7 @@ function App() {
               ))}
             </div>
           </section>
+          {nativeBackendAvailable && <AnalysisPanel copilot={copilot} hasConversation={transcript.length > 0} />}
           </div>
         </section>
       </div>

@@ -29,6 +29,10 @@ pub struct Settings {
     pub job: JobContext,
     pub auto_answer: bool,
     pub answer_mode: AnswerMode,
+    /// Post-interview report language: `pl`, `sv` or `en`.
+    pub report_language: String,
+    /// Model for the post-interview report; empty means `model`.
+    pub analysis_model: String,
 }
 
 impl Default for Settings {
@@ -42,6 +46,8 @@ impl Default for Settings {
             job: JobContext::default(),
             auto_answer: true,
             answer_mode: AnswerMode::Normal,
+            report_language: "pl".to_string(),
+            analysis_model: String::new(),
         }
     }
 }
@@ -49,6 +55,10 @@ impl Default for Settings {
 impl Settings {
     pub fn screen_model(&self) -> &str {
         if self.screen_model.trim().is_empty() { &self.model } else { &self.screen_model }
+    }
+
+    pub fn analysis_model(&self) -> &str {
+        if self.analysis_model.trim().is_empty() { &self.model } else { &self.analysis_model }
     }
 }
 
@@ -123,6 +133,8 @@ mod tests {
         assert_eq!(settings.model, "gpt-6-luna");
         assert!(settings.auto_answer);
         assert_eq!(settings.screen_model(), "gpt-6-luna");
+        assert_eq!(settings.analysis_model(), "gpt-6-luna");
+        assert_eq!(settings.report_language, "pl");
 
         let mut changed = settings.clone();
         changed.account_email = Some("me@example.com".into());

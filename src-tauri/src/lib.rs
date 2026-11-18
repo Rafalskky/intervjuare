@@ -14,6 +14,7 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod analysis;
 mod codex_auth;
 mod context;
 mod conversation;
@@ -7332,6 +7333,10 @@ pub fn run() {
             copilot::check_connection,
             copilot::force_answer,
             copilot::capture_screen_answer,
+            copilot::analyze_interview,
+            copilot::cancel_analysis,
+            copilot::save_analysis_report,
+            copilot::set_report_settings,
             copilot::submit_test_turn,
             copilot::clear_conversation,
             copilot::cancel_suggestion

@@ -212,6 +212,15 @@ fn format_job(job: &JobContext) -> String {
     }
 }
 
+/// Job context plus the interview language, for the post-interview report.
+pub fn format_job_for_analysis(job: &JobContext) -> String {
+    let language = match job.language {
+        Language::Sv => "sv",
+        Language::En => "en",
+    };
+    format!("{}\nInterview language: {language}", format_job(job))
+}
+
 pub fn speaker_label(speaker: Speaker) -> &'static str {
     match speaker {
         Speaker::Interviewer => "INTERVIEWER",

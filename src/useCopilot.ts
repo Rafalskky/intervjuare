@@ -2,12 +2,14 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
+  AnalysisEvent,
   AnswerMode,
   ConnectionStatus,
   CopilotStatus,
   InterviewLanguage,
   JobContext,
   MemoryEvent,
+  ReportLanguage,
   Speaker,
   SuggestionEvent,
 } from './copilotTypes'
@@ -31,6 +33,8 @@ export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, languag
   const [checking, setChecking] = useState(false)
   const [memory, setMemory] = useState<MemoryEvent | null>(null)
   const [commandSegments, setCommandSegments] = useState<string[]>([])
+  const [analysis, setAnalysis] = useState<AnalysisEvent | null>(null)
+  const [savedReport, setSavedReport] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const jobRef = useRef<JobContext | null>(null)
 
@@ -67,6 +71,9 @@ export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, languag
     }).then(keep).catch((cause) => active && setError(String(cause)))
     listen<MemoryEvent>('memory-event', ({ payload }) => {
       if (active) setMemory(payload)
+    }).then(keep).catch((cause) => active && setError(String(cause)))
+    listen<AnalysisEvent>('analysis-event', ({ payload }) => {
+      if (active) setAnalysis((current) => (current && payload.analysisId < current.analysisId ? current : payload))
     }).then(keep).catch((cause) => active && setError(String(cause)))
     listen<{ segmentId: string }>('voice-command', ({ payload }) => {
       if (active) setCommandSegments((current) => [...current, payload.segmentId])
@@ -105,6 +112,8 @@ export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, languag
     checking,
     memory,
     commandSegments,
+    analysis,
+    savedReport,
     error,
     checkConnection,
     applyJob,
@@ -137,12 +146,27 @@ export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, languag
     captureScreen: (applicationId: string) =>
       run(() => invoke<number>('capture_screen_answer', { applicationId: applicationId || null })),
     cancelSuggestion: () => run(() => invoke('cancel_suggestion')),
+    analyzeInterview: (reportLanguage: ReportLanguage) =>
+      run(async () => {
+        setSavedReport(null)
+        await invoke<number>('analyze_interview', { reportLanguage })
+        await refreshStatus()
+      }),
+    cancelAnalysis: () => run(() => invoke('cancel_analysis')),
+    saveReport: (text: string) => run(async () => setSavedReport(await invoke<string>('save_analysis_report', { text }))),
+    setReportSettings: (reportLanguage: ReportLanguage, analysisModel: string) =>
+      run(async () => {
+        await invoke('set_report_settings', { reportLanguage, analysisModel })
+        await refreshStatus()
+      }),
     clearConversation: () =>
       run(async () => {
         await invoke('clear_conversation')
         setView(EMPTY_SUGGESTION_VIEW)
         setMemory(null)
         setCommandSegments([])
+        setAnalysis(null)
+        setSavedReport(null)
       }),
     submitTestTurn: (speaker: Speaker, text: string) =>
       run(() => invoke<TTranscript>('submit_test_turn', { speaker, text })),

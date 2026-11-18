@@ -89,7 +89,8 @@ correctly listed stories used and candidate claims.
 
 ## Not yet implemented
 
-- Persistence of transcripts/suggestions/history (SQLite) and post-interview
-  analysis (Milestone 6).
-- Web search and follow-up prediction (Milestone 6).
+- Persistence of transcripts/suggestions/history (SQLite). Post-interview
+  analysis exists (`docs/post-interview.md`) but works on the in-memory
+  conversation only.
+- Web search and follow-up prediction (rest of Milestone 6).
 - Keyboard shortcuts.

@@ -34,6 +34,7 @@ Rust gains small, separately tested modules; the Phase 1 audio pipeline is uncha
 - `voice_command.rs`: local "Låt oss se" / "Let's see" detection.
 - `screen.rs` + Swift `screenshot` command: one in-memory screenshot per request.
 - `settings.rs`: persisted local settings.
+- `history.rs`: SQLite interview history behind a single writer thread (never blocks the live path).
 - `copilot.rs`: orchestration and Tauri commands; emits `suggestion-event`, `memory-event`, `voice-command`.
 
 ```text

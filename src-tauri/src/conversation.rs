@@ -112,6 +112,12 @@ impl Conversation {
         }
     }
 
+    /// Current text of a retained segment (an empty final keeps the last
+    /// valid hypothesis, so this can differ from the event text).
+    pub fn segment_text(&self, segment_id: &str) -> Option<&str> {
+        self.segments.iter().find(|segment| segment.id == segment_id).map(|segment| segment.text.as_str())
+    }
+
     /// Drops a segment entirely (an explicit voice command is not dialogue).
     pub fn remove_segment(&mut self, segment_id: &str) {
         self.segments.retain(|segment| segment.id != segment_id);

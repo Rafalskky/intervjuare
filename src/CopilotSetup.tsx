@@ -105,6 +105,11 @@ function AnswerSection({ copilot, settings }: { copilot: CopilotApi; settings: S
         <input type="checkbox" checked={settings.autoAnswer} onChange={(event) => void copilot.setAutoAnswer(event.target.checked)} />
         Answer automatically when the interviewer finishes
       </label>
+      <label className="mt-3 flex items-center gap-2 text-sm text-stone-300">
+        <input type="checkbox" checked={settings.historyEnabled} onChange={(event) => void copilot.setHistoryEnabled(event.target.checked)} />
+        Save interviews to local history (this Mac only)
+      </label>
+      {copilot.status?.historyError && <p className="mt-1 text-xs text-amber-200/80">History: {copilot.status.historyError}</p>}
       <label className={label} htmlFor="answer-mode">Default answer style</label>
       <select id="answer-mode" value={settings.answerMode} onChange={(event) => void copilot.setAnswerMode(event.target.value as AnswerMode)} className={field}>
         {(Object.keys(ANSWER_MODE_LABELS) as AnswerMode[]).map((mode) => <option key={mode} value={mode}>{ANSWER_MODE_LABELS[mode]}</option>)}

@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { SuggestionEvent, SuggestionStatus } from './copilotTypes.ts'
+import type { AnalysisEvent, InterviewDetail, SuggestionEvent, SuggestionStatus } from './copilotTypes.ts'
 import {
   applySuggestionEvent,
   EMPTY_SUGGESTION_VIEW,
   formatSeconds,
   isSuggestionStale,
   latencySummary,
+  durationLabel,
   modelChoices,
   parseTopics,
+  reportForInterview,
 } from './suggestionView.ts'
 
 function suggestion(id: number, status: SuggestionStatus, anchors: string[] = [], answer = ''): SuggestionEvent {
@@ -101,4 +103,23 @@ test('model choices keep saved selections that the account list lacks', () => {
   const models = [{ slug: 'gpt-6-luna', description: '' }, { slug: 'gpt-6.2-sol', description: '' }]
   assert.deepEqual(modelChoices(models, ['gpt-6-luna', '']), ['gpt-6-luna', 'gpt-6.2-sol'])
   assert.deepEqual(modelChoices([], ['gpt-6-luna', 'gpt-6.1-terra']), ['gpt-6.1-terra', 'gpt-6-luna'])
+})
+
+test('interview duration labels', () => {
+  assert.equal(durationLabel(0, 20_000), '< 1 min')
+  assert.equal(durationLabel(0, 42 * 60_000), '42 min')
+  assert.equal(durationLabel(0, 75 * 60_000), '1 h 15 min')
+  assert.equal(durationLabel(10, 0), '< 1 min')
+})
+
+test('a live analysis of the opened interview wins over the stored report', () => {
+  const detail = { id: 4, report: 'stored' } as InterviewDetail
+  const analysis = (id: number | null, status: AnalysisEvent['status'], text: string): AnalysisEvent =>
+    ({ analysisId: 1, status, text, error: null, model: 'm', savedInterviewId: id })
+  assert.equal(reportForInterview(detail, null).text, 'stored')
+  assert.equal(reportForInterview(detail, analysis(4, 'running', 'new…')).text, 'new…')
+  assert.equal(reportForInterview(detail, analysis(9, 'done', 'other interview')).text, 'stored')
+  assert.equal(reportForInterview(detail, analysis(null, 'done', 'live interview')).text, 'stored')
+  assert.equal(reportForInterview(detail, analysis(4, 'failed', '')).text, 'stored')
+  assert.equal(reportForInterview(null, analysis(4, 'done', 'x')).text, null)
 })

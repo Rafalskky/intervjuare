@@ -3,6 +3,8 @@ import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   AnalysisEvent,
+  InterviewDetail,
+  InterviewSummary,
   AnswerMode,
   ConnectionStatus,
   CopilotStatus,
@@ -98,6 +100,10 @@ export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, languag
     [run, refreshStatus],
   )
 
+  // Stable identities: HistoryView effects depend on these.
+  const listInterviews = useCallback(() => run(() => invoke<InterviewSummary[]>('list_interviews')), [run])
+  const getInterview = useCallback((id: number) => run(() => invoke<InterviewDetail>('get_interview', { id })), [run])
+
   // The interview language is chosen once (audio setup) and shared with the model.
   useEffect(() => {
     const job = jobRef.current
@@ -153,6 +159,19 @@ export function useCopilot<TTranscript>(nativeBackendAvailable: boolean, languag
         await refreshStatus()
       }),
     cancelAnalysis: () => run(() => invoke('cancel_analysis')),
+    setHistoryEnabled: (enabled: boolean) =>
+      run(async () => {
+        await invoke('set_history_enabled', { enabled })
+        await refreshStatus()
+      }),
+    listInterviews,
+    getInterview,
+    deleteInterview: (id: number) => run(() => invoke<boolean>('delete_interview', { id })),
+    analyzeSavedInterview: (id: number, reportLanguage: ReportLanguage) =>
+      run(async () => {
+        await invoke<number>('analyze_saved_interview', { id, reportLanguage })
+        await refreshStatus()
+      }),
     saveReport: (text: string) => run(async () => setSavedReport(await invoke<string>('save_analysis_report', { text }))),
     setReportSettings: (reportLanguage: ReportLanguage, analysisModel: string) =>
       run(async () => {

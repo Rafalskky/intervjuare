@@ -148,7 +148,10 @@ fn prepare_whisper_runtime(model_name: &str, expected_model_len: u64) {
     ))
     .expect("canonical Cargo manifest directory");
     let root = manifest_dir.parent().expect("project root").to_path_buf();
-    let whisper_build = root.join("vendor/whisper.cpp/build");
+    // Resolve a symlinked build (e.g. a git worktree reusing the main
+    // checkout's whisper.cpp build): the binary's rpaths name the real path.
+    let whisper_build_link = root.join("vendor/whisper.cpp/build");
+    let whisper_build = fs::canonicalize(&whisper_build_link).unwrap_or(whisper_build_link);
     let server = whisper_build.join("bin/whisper-server");
     let model = root.join(format!("assets/models/{model_name}"));
     println!("cargo:rerun-if-changed={}", server.display());

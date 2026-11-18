@@ -19,6 +19,7 @@ use crate::{
     codex_auth::{self, Account, AccountSummary},
     context::{self, AnswerMode, AnswerOptions, ContextPackage, JobContext, UsedStory},
     conversation::{self, Conversation, Turn, Update},
+    history::{self, History, InterviewDetail, InterviewSummary, StoredSegment, StoredSuggestion, Target},
     llm::{self, CancelToken, ModelInfo, ModelRequest, StreamOutcome},
     memory::{self, InterviewMemory},
     profile::{self, Profile, ProfileSummary},
@@ -147,11 +148,29 @@ struct CopilotInner {
     command_segments: HashSet<String>,
     screen_application: Option<String>,
     analysis: Option<(u64, Arc<CancelToken>)>,
+    history: History,
+    /// History key of the interview being recorded; created lazily on the
+    /// first stored item so empty sessions leave no entry.
+    history_key: Option<String>,
+    history_keys_made: u64,
+}
+
+/// Everything a post-interview report run needs, planned under the lock.
+struct AnalysisPlan {
+    id: u64,
+    request: ModelRequest,
+    token: Arc<CancelToken>,
+    account_email: Option<String>,
+    language: String,
+    /// Where to store the finished report, if history is on.
+    history_target: Option<Target>,
+    saved_interview_id: Option<i64>,
 }
 
 impl CopilotInner {
     fn new(settings_path: PathBuf) -> Self {
         let (settings, settings_warning) = settings::load(&settings_path);
+        let settings_path_for_history = settings_path.clone();
         let profile_path = settings.profile_path.as_ref().map(PathBuf::from).unwrap_or_else(profile::default_profile_path);
         let mut inner = Self {
             conversation: Conversation::default(),
@@ -171,6 +190,9 @@ impl CopilotInner {
             command_segments: HashSet::new(),
             screen_application: None,
             analysis: None,
+            history: History::spawn(history::history_path(&settings_path_for_history)),
+            history_key: None,
+            history_keys_made: 0,
         };
         let _ = inner.load_profile(profile_path);
         inner
@@ -216,6 +238,7 @@ impl CopilotInner {
             job.cancel();
         }
         self.conversation.reset(session_id);
+        self.history_key = None;
         self.memory = InterviewMemory::default();
         self.stories_used.clear();
         self.last_sources.clear();
@@ -235,7 +258,11 @@ impl CopilotInner {
             let application = self.screen_application.clone();
             return self.plan_screen(application, false);
         }
-        match self.conversation.apply(event) {
+        let update = self.conversation.apply(event);
+        if matches!(update, Update::Changed { final_segment: true, .. }) {
+            self.record_segment(event);
+        }
+        match update {
             Update::Ignored | Update::Changed { speaker: Speaker::Candidate, .. } => Vec::new(),
             Update::Changed { speaker: Speaker::Interviewer, segment_id, final_segment: false } => {
                 let continues_active_turn = match (&self.active, self.conversation.turn_of_segment(&segment_id)) {
@@ -354,6 +381,18 @@ impl CopilotInner {
             self.active = None;
         }
         if final_event.status == SuggestionStatus::Done {
+            let suggestion = StoredSuggestion {
+                suggestion_id: final_event.suggestion_id,
+                created_at_ms: final_event.timing.finished_at_ms.unwrap_or_else(now_ms),
+                question: final_event.question.clone(),
+                anchors: final_event.anchors.clone(),
+                answer: final_event.answer.clone(),
+                sources: final_event.sources.clone(),
+                mode: final_event.mode,
+                screen: final_event.screen,
+                model: final_event.model.clone(),
+            };
+            self.record(|key| history::Command::Suggestion { key, suggestion });
             self.last_sources = final_event.sources.clone();
             for id in &final_event.sources {
                 if !self.stories_used.iter().any(|story| &story.id == id) {
@@ -373,15 +412,51 @@ impl CopilotInner {
             self.memory.text = text.clone();
             self.memory.covered_until_ms = plan.absorbed_until_ms;
             self.memory.absorbed_turns += plan.absorbed_turns;
+            let text = text.clone();
+            self.record(|key| history::Command::Memory { key, text });
         }
         true
     }
 
-    /// Post-interview report request from everything known about this interview.
-    fn plan_analysis(&mut self, report_language: Option<String>) -> Result<(u64, ModelRequest, Arc<CancelToken>, Option<String>), String> {
-        if let Some(language) = report_language.filter(|language| matches!(language.as_str(), "pl" | "sv" | "en")) {
-            self.settings.report_language = language;
+    /// Key of the interview being recorded, creating its entry on first use.
+    /// `None` when history is off. Sending never blocks.
+    fn history_key(&mut self) -> Option<String> {
+        if !self.settings.history_enabled {
+            return None;
         }
+        if let Some(key) = &self.history_key {
+            return Some(key.clone());
+        }
+        self.history_keys_made += 1;
+        let now = now_ms();
+        let key = format!("{now}-{}-{}", std::process::id(), self.history_keys_made);
+        self.history.send(history::Command::Begin { key: key.clone(), started_at_ms: now, job: self.settings.job.clone() });
+        self.history_key = Some(key.clone());
+        Some(key)
+    }
+
+    fn record(&mut self, make: impl FnOnce(String) -> history::Command) {
+        if let Some(key) = self.history_key() {
+            self.history.send(make(key));
+        }
+    }
+
+    fn record_segment(&mut self, event: &TranscriptEvent) {
+        let Some(text) = self.conversation.segment_text(&event.segment_id).map(str::to_string) else { return };
+        let segment = StoredSegment {
+            segment_id: event.segment_id.clone(),
+            speaker: event.speaker,
+            text,
+            started_at_ms: event.started_at_ms,
+            ended_at_ms: event.ended_at_ms,
+            simulated: event.segment_id.starts_with("simulated-"),
+        };
+        self.record(|key| history::Command::Segment { key, segment });
+    }
+
+    /// Post-interview report request from everything known about this interview.
+    fn plan_analysis(&mut self, report_language: Option<String>) -> Result<AnalysisPlan, String> {
+        self.set_report_language(report_language);
         let request = analysis::build_request(
             &self.settings.job,
             self.profile.as_deref(),
@@ -392,6 +467,37 @@ impl CopilotInner {
             self.settings.analysis_model(),
             &self.settings.reasoning_effort,
         )?;
+        // Only an interview that is already being recorded gets the report.
+        let target = self.history_key.clone().filter(|_| self.settings.history_enabled).map(Target::Key);
+        Ok(self.start_analysis(request, target, None))
+    }
+
+    /// Report for an interview loaded from history (works after a restart).
+    /// Uses the profile as it is now: profile.yaml is the source of truth.
+    fn plan_saved_analysis(&mut self, detail: &InterviewDetail, report_language: Option<String>) -> Result<AnalysisPlan, String> {
+        self.set_report_language(report_language);
+        let request = analysis::build_request(
+            &detail.job,
+            self.profile.as_deref(),
+            &detail.memory,
+            &detail.stories_used(),
+            &detail.turns(),
+            &self.settings.report_language,
+            self.settings.analysis_model(),
+            &self.settings.reasoning_effort,
+        )?;
+        let id = detail.summary.id;
+        let target = self.settings.history_enabled.then_some(Target::Id(id));
+        Ok(self.start_analysis(request, target, Some(id)))
+    }
+
+    fn set_report_language(&mut self, report_language: Option<String>) {
+        if let Some(language) = report_language.filter(|language| matches!(language.as_str(), "pl" | "sv" | "en")) {
+            self.settings.report_language = language;
+        }
+    }
+
+    fn start_analysis(&mut self, request: ModelRequest, history_target: Option<Target>, saved_interview_id: Option<i64>) -> AnalysisPlan {
         if let Some((_, previous)) = self.analysis.take() {
             previous.cancel();
         }
@@ -399,7 +505,15 @@ impl CopilotInner {
         self.next_id += 1;
         let token = Arc::new(CancelToken::default());
         self.analysis = Some((id, token.clone()));
-        Ok((id, request, token, self.settings.account_email.clone()))
+        AnalysisPlan {
+            id,
+            request,
+            token,
+            account_email: self.settings.account_email.clone(),
+            language: self.settings.report_language.clone(),
+            history_target,
+            saved_interview_id,
+        }
     }
 
     fn simulated_event(&mut self, speaker: Speaker, text: &str) -> Result<TranscriptEvent, String> {
@@ -651,12 +765,15 @@ pub struct AnalysisEvent {
     pub text: String,
     pub error: Option<String>,
     pub model: String,
+    /// Set when the report is for an interview opened from history.
+    pub saved_interview_id: Option<i64>,
 }
 
 /// Streams the post-interview report; emits at most every ~150 ms of
 /// new text so a long report does not flood the UI.
 fn run_analysis(
     id: u64,
+    saved_interview_id: Option<i64>,
     request: &ModelRequest,
     token: &CancelToken,
     account: Result<Account, String>,
@@ -664,7 +781,14 @@ fn run_analysis(
     base_url: &str,
     mut emit: impl FnMut(&AnalysisEvent),
 ) -> AnalysisEvent {
-    let mut event = AnalysisEvent { analysis_id: id, status: AnalysisStatus::Running, text: String::new(), error: None, model: request.model.clone() };
+    let mut event = AnalysisEvent {
+        analysis_id: id,
+        status: AnalysisStatus::Running,
+        text: String::new(),
+        error: None,
+        model: request.model.clone(),
+        saved_interview_id,
+    };
     emit(&event);
     let account = match account {
         Ok(account) => account,
@@ -711,6 +835,8 @@ pub struct CopilotStatus {
     pub memory: String,
     pub memory_turns: usize,
     pub stories_used: Vec<String>,
+    pub history_path: String,
+    pub history_error: Option<String>,
 }
 
 #[tauri::command]
@@ -728,6 +854,8 @@ pub fn copilot_status(copilot: State<'_, Copilot>) -> Result<CopilotStatus, Stri
         memory: inner.memory.text.clone(),
         memory_turns: inner.memory.absorbed_turns,
         stories_used: inner.stories_used.iter().map(|story| story.id.clone()).collect(),
+        history_path: history::history_path(&inner.settings_path).display().to_string(),
+        history_error: inner.history.last_error(),
     })
 }
 
@@ -748,7 +876,10 @@ pub fn load_candidate_profile(copilot: State<'_, Copilot>, path: Option<String>)
 #[tauri::command]
 pub fn set_job_context(copilot: State<'_, Copilot>, job: JobContext) -> Result<(), String> {
     let mut inner = copilot.lock()?;
-    inner.settings.job = job;
+    inner.settings.job = job.clone();
+    if let Some(key) = inner.history_key.clone().filter(|_| inner.settings.history_enabled) {
+        inner.history.send(history::Command::Job { key, job });
+    }
     inner.persist()
 }
 
@@ -862,25 +993,38 @@ pub fn submit_test_turn(app: AppHandle, copilot: State<'_, Copilot>, speaker: Sp
 /// Starts the post-interview report for the current conversation.
 #[tauri::command]
 pub fn analyze_interview(app: AppHandle, copilot: State<'_, Copilot>, report_language: Option<String>) -> Result<u64, String> {
-    let (id, request, token, email) = {
+    let plan = {
         let mut inner = copilot.lock()?;
-        let planned = inner.plan_analysis(report_language)?;
+        let plan = inner.plan_analysis(report_language)?;
         let _ = inner.persist();
-        planned
+        plan
     };
-    let state = copilot.0.clone();
+    Ok(spawn_analysis(app, copilot.0.clone(), plan))
+}
+
+fn spawn_analysis(app: AppHandle, state: Arc<Mutex<CopilotInner>>, plan: AnalysisPlan) -> u64 {
+    let id = plan.id;
     thread::spawn(move || {
-        let account = resolve_account(email.as_deref());
-        run_analysis(id, &request, &token, account, CURL_BIN, &llm::base_url(), |event| {
+        let account = resolve_account(plan.account_email.as_deref());
+        let last = run_analysis(plan.id, plan.saved_interview_id, &plan.request, &plan.token, account, CURL_BIN, &llm::base_url(), |event| {
             let _ = app.emit(ANALYSIS_EVENT, event);
         });
         if let Ok(mut inner) = state.lock() {
-            if inner.analysis.as_ref().is_some_and(|(current, _)| *current == id) {
+            if inner.analysis.as_ref().is_some_and(|(current, _)| *current == plan.id) {
                 inner.analysis = None;
+            }
+            if let (AnalysisStatus::Done, Some(target)) = (last.status, plan.history_target) {
+                inner.history.send(history::Command::Report {
+                    target,
+                    text: last.text,
+                    language: plan.language,
+                    model: last.model,
+                    at_ms: now_ms(),
+                });
             }
         }
     });
-    Ok(id)
+    id
 }
 
 #[tauri::command]
@@ -911,6 +1055,61 @@ pub fn set_report_settings(copilot: State<'_, Copilot>, report_language: String,
     inner.settings.report_language = report_language;
     inner.settings.analysis_model = analysis_model.trim().to_string();
     inner.persist()
+}
+
+#[tauri::command]
+pub fn set_history_enabled(copilot: State<'_, Copilot>, enabled: bool) -> Result<(), String> {
+    let mut inner = copilot.lock()?;
+    inner.settings.history_enabled = enabled;
+    if !enabled {
+        // Stop recording the current interview; turning it back on starts a new entry.
+        inner.history_key = None;
+    }
+    inner.persist()
+}
+
+fn history_handle(copilot: &State<'_, Copilot>) -> Result<History, String> {
+    Ok(copilot.lock()?.history.clone())
+}
+
+#[tauri::command]
+pub async fn list_interviews(copilot: State<'_, Copilot>) -> Result<Vec<InterviewSummary>, String> {
+    let history = history_handle(&copilot)?;
+    tauri::async_runtime::spawn_blocking(move || history.list()).await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_interview(copilot: State<'_, Copilot>, id: i64) -> Result<InterviewDetail, String> {
+    let history = history_handle(&copilot)?;
+    tauri::async_runtime::spawn_blocking(move || history.get(id))
+        .await
+        .map_err(|error| error.to_string())??
+        .ok_or_else(|| "This interview no longer exists.".to_string())
+}
+
+/// Deletes one interview with everything stored for it. Deleting the
+/// interview that is being recorded stops recording it.
+#[tauri::command]
+pub async fn delete_interview(copilot: State<'_, Copilot>, id: i64) -> Result<bool, String> {
+    let history = history_handle(&copilot)?;
+    tauri::async_runtime::spawn_blocking(move || history.delete(id)).await.map_err(|error| error.to_string())?
+}
+
+/// Post-interview report for a saved interview (also after a restart).
+#[tauri::command]
+pub async fn analyze_saved_interview(app: AppHandle, copilot: State<'_, Copilot>, id: i64, report_language: Option<String>) -> Result<u64, String> {
+    let history = history_handle(&copilot)?;
+    let detail = tauri::async_runtime::spawn_blocking(move || history.get(id))
+        .await
+        .map_err(|error| error.to_string())??
+        .ok_or_else(|| "This interview no longer exists.".to_string())?;
+    let plan = {
+        let mut inner = copilot.lock()?;
+        let plan = inner.plan_saved_analysis(&detail, report_language)?;
+        let _ = inner.persist();
+        plan
+    };
+    Ok(spawn_analysis(app, copilot.0.clone(), plan))
 }
 
 #[tauri::command]
@@ -1131,13 +1330,15 @@ mod tests {
         inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om dig själv.", true, 0));
         inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Jag heter Alex.", true, 2_000));
         inner.memory.text = "topics_discussed: [intro]".into();
-        let (first_id, request, first_token, _) = inner.plan_analysis(Some("sv".into())).unwrap();
+        let first = inner.plan_analysis(Some("sv".into())).unwrap();
+        let (first_id, request, first_token) = (first.id, first.request, first.token);
+        assert_eq!(first.saved_interview_id, None);
         assert_eq!(inner.settings.report_language, "sv");
         assert!(request.text.starts_with("REPORT LANGUAGE\nSwedish"));
         assert!(request.text.contains("CANDIDATE: Jag heter Alex."));
         assert!(request.text.contains("topics_discussed: [intro]"));
         assert_eq!(request.model, "gpt-6-luna");
-        let (second_id, _, _, _) = inner.plan_analysis(Some("xx".into())).unwrap();
+        let second_id = inner.plan_analysis(Some("xx".into())).unwrap().id;
         assert!(first_token.is_cancelled(), "a new report supersedes the running one");
         assert!(second_id > first_id);
         assert_eq!(inner.settings.report_language, "sv", "invalid language is ignored");
@@ -1157,15 +1358,121 @@ mod tests {
             cache_key: None,
         };
         let mut events = Vec::new();
-        let last = run_analysis(7, &request, &CancelToken::default(), Ok(account()), CURL_BIN, &base, |event| events.push(event.clone()));
+        let last = run_analysis(7, None, &request, &CancelToken::default(), Ok(account()), CURL_BIN, &base, |event| events.push(event.clone()));
         assert_eq!(events.first().unwrap().status, AnalysisStatus::Running);
         assert_eq!(last.status, AnalysisStatus::Done);
         assert_eq!(last.text, "## Summary\nBra intervju.");
         assert_eq!(&last, events.last().unwrap());
 
-        let last = run_analysis(8, &request, &CancelToken::default(), Err("No ChatGPT/Codex sign-in found".into()), CURL_BIN, &base, |_| {});
+        let last = run_analysis(8, None, &request, &CancelToken::default(), Err("No ChatGPT/Codex sign-in found".into()), CURL_BIN, &base, |_| {});
         assert_eq!(last.status, AnalysisStatus::Failed);
         assert!(last.error.unwrap().contains("sign-in"));
+    }
+
+    fn settle(inner: &CopilotInner) -> Vec<InterviewSummary> {
+        // The writer is FIFO: a read answers only after earlier writes ran.
+        inner.history.list().unwrap()
+    }
+
+    fn done_event(id: u64, question: &str, sources: &[&str]) -> SuggestionEvent {
+        SuggestionEvent {
+            suggestion_id: id,
+            status: SuggestionStatus::Done,
+            question: question.into(),
+            anchors: vec!["a".into()],
+            answer: "svar".into(),
+            sources: sources.iter().map(|source| source.to_string()).collect(),
+            unverified_sources: vec![],
+            no_verified_example: false,
+            error: None,
+            forced: false,
+            mode: AnswerMode::Normal,
+            alternative: false,
+            screen: false,
+            model: "gpt-6-luna".into(),
+            timing: SuggestionTiming { finished_at_ms: Some(3_000), ..SuggestionTiming::default() },
+        }
+    }
+
+    #[test]
+    fn history_records_finals_suggestions_memory_but_not_partials_or_commands() {
+        let (mut inner, _workspace) = inner();
+        assert!(settle(&inner).is_empty(), "nothing is stored before the first final segment");
+        inner.settings.job.company = "Example AB".into();
+        inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta", false, 0));
+        assert!(settle(&inner).is_empty(), "partials are not history");
+        inner.on_transcript(&event("interviewer-1", 2, Speaker::Interviewer, "Berätta om ett problem.", true, 0));
+        inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Låt oss se.", true, 2_000));
+        inner.on_transcript(&event("candidate-2", 1, Speaker::Candidate, "I Sagobo hittade jag en bugg.", true, 3_000));
+        inner.finish(&done_event(1, "Berätta om ett problem.", &["password_reset_race_condition"]));
+        let mut cancelled = done_event(2, "x", &[]);
+        cancelled.status = SuggestionStatus::Cancelled;
+        inner.finish(&cancelled);
+        let token = Arc::new(CancelToken::default());
+        inner.memory_job = Some(token.clone());
+        let plan = MemoryPlan {
+            request: ModelRequest { model: "m".into(), reasoning_effort: String::new(), instructions: String::new(), text: String::new(), image_data_url: None, cache_key: None },
+            absorbed_until_ms: 3_900,
+            absorbed_turns: 2,
+            account_email: None,
+        };
+        inner.finish_memory(&token, &plan, &Ok("topics_discussed: [Sagobo]".into()));
+
+        let list = settle(&inner);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].company, "Example AB");
+        let detail = inner.history.get(list[0].id).unwrap().unwrap();
+        let texts: Vec<&str> = detail.segments.iter().map(|segment| segment.text.as_str()).collect();
+        assert_eq!(texts, vec!["Berätta om ett problem.", "I Sagobo hittade jag en bugg."], "the voice command is not stored as dialogue");
+        assert_eq!(detail.suggestions.len(), 1, "only finished suggestions are stored");
+        assert_eq!(detail.suggestions[0].sources, vec!["password_reset_race_condition"]);
+        assert_eq!(detail.memory, "topics_discussed: [Sagobo]");
+
+        inner.reset_interview(None);
+        inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Ny intervju?", true, 0));
+        assert_eq!(settle(&inner).len(), 2, "a new interview gets its own entry");
+    }
+
+    #[test]
+    fn disabled_history_stores_nothing_and_reenabling_starts_a_new_entry() {
+        let (mut inner, _workspace) = inner();
+        inner.settings.history_enabled = false;
+        inner.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Berätta om dig själv.", true, 0));
+        inner.finish(&done_event(1, "Berätta om dig själv.", &[]));
+        assert!(settle(&inner).is_empty());
+        assert!(inner.plan_analysis(None).unwrap().history_target.is_none(), "no report is stored either");
+
+        inner.settings.history_enabled = true;
+        inner.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Jag heter Alex.", true, 2_000));
+        let list = settle(&inner);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].segment_count, 1, "only what was said while history was on");
+        assert!(matches!(inner.plan_analysis(None).unwrap().history_target, Some(Target::Key(_))));
+    }
+
+    #[test]
+    fn saved_interviews_can_be_analysed_after_a_restart() {
+        let workspace = crate::InferenceWorkspace::new().unwrap();
+        let settings_path = workspace.path.join("settings.json");
+        {
+            let mut first_run = CopilotInner::new(settings_path.clone());
+            first_run.settings.job.role = "Backend".into();
+            first_run.on_transcript(&event("interviewer-1", 1, Speaker::Interviewer, "Har du jobbat med Java?", true, 0));
+            first_run.on_transcript(&event("candidate-1", 1, Speaker::Candidate, "Inte mycket, men jag lär mig.", true, 2_000));
+            first_run.finish(&done_event(1, "Har du jobbat med Java?", &["sagobo"]));
+            assert_eq!(settle(&first_run).len(), 1);
+        }
+        let mut restarted = CopilotInner::new(settings_path);
+        assert!(restarted.conversation.turns().is_empty(), "the live conversation is gone after a restart");
+        let id = settle(&restarted)[0].id;
+        let detail = restarted.history.get(id).unwrap().unwrap();
+        let plan = restarted.plan_saved_analysis(&detail, Some("en".into())).unwrap();
+        assert_eq!(plan.saved_interview_id, Some(id));
+        assert_eq!(plan.history_target, Some(Target::Id(id)));
+        assert!(plan.request.text.starts_with("REPORT LANGUAGE\nEnglish"));
+        assert!(plan.request.text.contains("Role: Backend"));
+        assert!(plan.request.text.contains("CANDIDATE: Inte mycket, men jag lär mig."));
+        assert!(plan.request.text.contains("- sagobo (suggested for: Har du jobbat med Java?)"));
     }
 
     #[test]

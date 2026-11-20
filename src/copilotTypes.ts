@@ -60,6 +60,7 @@ export type Settings = {
   answerMode: AnswerMode
   reportLanguage: ReportLanguage
   analysisModel: string
+  historyEnabled: boolean
 }
 
 export type ReportLanguage = 'pl' | 'sv' | 'en'
@@ -70,6 +71,52 @@ export type AnalysisEvent = {
   text: string
   error: string | null
   model: string
+  savedInterviewId: number | null
+}
+
+export type InterviewSummary = {
+  id: number
+  startedAtMs: number
+  lastActivityMs: number
+  company: string
+  role: string
+  language: InterviewLanguage
+  segmentCount: number
+  suggestionCount: number
+  hasReport: boolean
+  simulatedOnly: boolean
+}
+
+export type StoredSegment = {
+  segmentId: string
+  speaker: Speaker
+  text: string
+  startedAtMs: number
+  endedAtMs: number
+  simulated: boolean
+}
+
+export type StoredSuggestion = {
+  suggestionId: number
+  createdAtMs: number
+  question: string
+  anchors: string[]
+  answer: string
+  sources: string[]
+  mode: AnswerMode
+  screen: boolean
+  model: string
+}
+
+export type InterviewDetail = InterviewSummary & {
+  job: JobContext
+  memory: string
+  report: string | null
+  reportLanguage: string | null
+  reportModel: string | null
+  reportAtMs: number | null
+  segments: StoredSegment[]
+  suggestions: StoredSuggestion[]
 }
 
 export type AccountSummary = {
@@ -102,4 +149,6 @@ export type CopilotStatus = {
   memory: string
   memoryTurns: number
   storiesUsed: string[]
+  historyPath: string
+  historyError: string | null
 }

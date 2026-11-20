@@ -16,7 +16,8 @@ export function AnalysisPanel({ copilot, hasConversation }: { copilot: CopilotAp
   const [language, setLanguage] = useState<ReportLanguage>(settings?.reportLanguage ?? 'pl')
   const [model, setModel] = useState(settings?.analysisModel ?? '')
   const [copied, setCopied] = useState(false)
-  const analysis = copilot.analysis
+  // Reports for interviews opened from History are shown there, not here.
+  const analysis = copilot.analysis?.savedInterviewId == null ? copilot.analysis : null
   const running = analysis?.status === 'running'
   const models = modelChoices(copilot.connection?.models ?? [], [model])
 

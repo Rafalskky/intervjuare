@@ -12,6 +12,7 @@ import {
 } from './screenPermission'
 import { AnalysisPanel } from './AnalysisPanel'
 import { CopilotSetup } from './CopilotSetup'
+import { HistoryView } from './HistoryView'
 import { SuggestionPanel } from './SuggestionPanel'
 import { isSuggestionStale } from './suggestionView'
 import { useCopilot } from './useCopilot'
@@ -58,6 +59,7 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [permissionLoading, setPermissionLoading] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
+  const [view, setView] = useState<'interview' | 'history'>('interview')
   const [sessionGate] = useState(() => {
     let dispatch = (_event: PendingCaptureEvent) => {}
     return {
@@ -263,12 +265,31 @@ function App() {
             <p className="text-xs font-semibold uppercase tracking-[0.26em] text-emerald-300">Milestones 1–6</p>
             <h1 className="mt-1 text-3xl font-semibold">Interview copilot</h1>
           </div>
-          <span className={`rounded-full px-4 py-2 text-sm ${running ? 'bg-red-400/15 text-red-200' : 'bg-white/5 text-stone-400'}`}>
-            {captureState.state === 'capturing' ? '● LIVE' : captureState.state.toUpperCase()}
-          </span>
+          <div className="flex items-center gap-3">
+            {nativeBackendAvailable && (
+              <nav className="flex rounded-full border border-white/10 p-1 text-sm" aria-label="View">
+                {(['interview', 'history'] as const).map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    aria-pressed={view === item}
+                    onClick={() => setView(item)}
+                    className={`rounded-full px-3 py-1 ${view === item ? 'bg-white/10 text-stone-100' : 'text-stone-400'}`}
+                  >
+                    {item === 'interview' ? 'Interview' : 'History'}
+                  </button>
+                ))}
+              </nav>
+            )}
+            <span className={`rounded-full px-4 py-2 text-sm ${running ? 'bg-red-400/15 text-red-200' : 'bg-white/5 text-stone-400'}`}>
+              {captureState.state === 'capturing' ? '● LIVE' : captureState.state.toUpperCase()}
+            </span>
+          </div>
         </header>
 
-        <section className="grid gap-5 lg:grid-cols-[340px_1fr]">
+        {view === 'history' && nativeBackendAvailable && <HistoryView copilot={copilot} />}
+        {/* The interview view stays mounted so its form state survives tab switches. */}
+        <section className={view === 'interview' ? 'grid gap-5 lg:grid-cols-[340px_1fr]' : 'hidden'}>
           <div>
           <aside className="rounded-2xl border border-white/10 bg-[#11151b] p-5">
             <h2 className="text-lg font-medium">Audio setup</h2>

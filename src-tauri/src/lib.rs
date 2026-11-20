@@ -19,6 +19,7 @@ mod codex_auth;
 mod context;
 mod conversation;
 mod copilot;
+mod history;
 mod llm;
 mod memory;
 mod profile;
@@ -7337,6 +7338,11 @@ pub fn run() {
             copilot::cancel_analysis,
             copilot::save_analysis_report,
             copilot::set_report_settings,
+            copilot::set_history_enabled,
+            copilot::list_interviews,
+            copilot::get_interview,
+            copilot::delete_interview,
+            copilot::analyze_saved_interview,
             copilot::submit_test_turn,
             copilot::clear_conversation,
             copilot::cancel_suggestion

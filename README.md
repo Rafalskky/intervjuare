@@ -1413,7 +1413,7 @@ INTERVJUARE_CODESIGN_IDENTITY="<identity from: security find-identity -v -p code
 
 See `docs/audio-pipeline.md` ("Stable permissions across rebuilds") for signing details, `docs/model-runtime.md` for choosing the ChatGPT account and model, `docs/profile-format.md` for the profile, and `docs/context-management.md` for how interview turns trigger suggestions.
 
-After an interview, **Analyse interview** produces a report (`docs/post-interview.md`). See `HANDOFF.md` for the current state and the owner checklist.
+After an interview, **Analyse interview** produces a report (`docs/post-interview.md`). Interviews are kept in a local SQLite history (`docs/history.md`; on by default, can be turned off, each interview can be deleted). See `HANDOFF.md` for the current state and the owner checklist.
 
 Without audio, the copilot can be tried with **Test without audio**: typed interviewer/candidate turns take the same conversation and model path as transcribed speech.
 

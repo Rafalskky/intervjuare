@@ -28,7 +28,7 @@ src-tauri/target/
 src-tauri/gen/schemas/
 src-tauri/intervjuare-macos-bridge-*
 native/macos/.build/
-vendor/whisper.cpp/build/
+vendor/whisper.cpp/build
 
 # Large local Whisper models (download separately, see README "Setup")
 assets/models/*.bin

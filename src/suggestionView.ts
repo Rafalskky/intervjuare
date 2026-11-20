@@ -1,4 +1,4 @@
-import type { AnswerMode, ModelInfo, Speaker, SuggestionEvent, SuggestionTiming } from './copilotTypes.ts'
+import type { AnalysisEvent, AnswerMode, InterviewDetail, ModelInfo, Speaker, SuggestionEvent, SuggestionTiming } from './copilotTypes.ts'
 
 /** What the suggestion panel shows. `fallback` is the last suggestion with
  * visible content; it comes back when a newer turn turns out to need no
@@ -86,4 +86,20 @@ export function modelChoices(models: ModelInfo[], selected: string[]): string[] 
     if (slug && !slugs.includes(slug)) slugs.unshift(slug)
   }
   return slugs
+}
+
+/** Human duration between the first and last stored item, e.g. "42 min". */
+export function durationLabel(startedAtMs: number, lastActivityMs: number): string {
+  const minutes = Math.round(Math.max(0, lastActivityMs - startedAtMs) / 60_000)
+  if (minutes < 1) return '< 1 min'
+  if (minutes < 60) return `${minutes} min`
+  return `${Math.floor(minutes / 60)} h ${minutes % 60} min`
+}
+
+/** Report to show for a saved interview: a running or just-finished
+ * analysis of that interview wins over the stored report. */
+export function reportForInterview(detail: InterviewDetail | null, analysis: AnalysisEvent | null): { text: string | null; live: AnalysisEvent | null } {
+  const live = detail && analysis && analysis.savedInterviewId === detail.id ? analysis : null
+  if (live && (live.status === 'running' || live.status === 'done') && live.text) return { text: live.text, live }
+  return { text: detail?.report ?? null, live }
 }

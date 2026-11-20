@@ -1,4 +1,4 @@
-# Handoff: Intervjuare (state as of 2026-11-18)
+# Handoff: Intervjuare (state as of 2026-11-18, evening)
 
 Read `README.md` (product) and `AGENTS.md` (implementation rules) first. This
 file is the current state, the owner's decisions, and what to do next.
@@ -28,10 +28,13 @@ file is the current state, the owner's decisions, and what to do next.
 | 4 Interview memory + stories already used | Done | Unit tests; live memory update ≈ 4.6 s, accurate |
 | 5 "Låt oss se" / screen assistance | Implemented | Detection and request path unit-tested; Swift command compiles and returns the typed permission error. **Real capture not verified live.** |
 | 6 Post-interview analysis | Done (part 1) | Unit tests; live Polish report in ≈ 28 s, grounded |
-| 6 Web search, follow-up prediction, SQLite history | Not started | |
+| 6 Interview history (SQLite) | Done (part 2) | Store, writer thread, schema versioning, disabled/enabled, delete and restart-then-analyse covered by tests. **UI clicked through only by the owner so far.** |
+| 6 Web search, follow-up prediction | Not started | |
 
-Branch: `milestone-2-hermes-anchors` (name outdated; holds Milestones 2–6, not
-merged). `main` = Milestone 1 import.
+Branches: `milestone-2-hermes-anchors` (name outdated; Milestones 2–6 part 1),
+`milestone-6-next` (adds history; work continues here in the git worktree
+`~/.t3/worktrees/Intervjuare/milestone-6-next`). Nothing is merged; `main` =
+Milestone 1 import.
 
 ## Owner checklist (what the owner still has to do)
 
@@ -47,15 +50,18 @@ merged). `main` = Milestone 1 import.
 5. Test without audio (typed turns), then "Låt oss se" and Capture screen.
 6. Milestone 1 live test: meeting app + headphones, Swedish and English,
    candidate-only, interviewer-only, both.
-7. After a test interview: Analyse interview → read the report.
+7. After a test interview: Analyse interview → read the report. Open
+   **History**, check the interview is there, then quit and restart the app and
+   use **Analyse again** on it. Turn "Save interviews to local history" off if
+   you do not want interviews kept.
 8. Decide whether to merge the branch into `main`.
 
 ## Build and test
 
 ```bash
 export INTERVJUARE_CODESIGN_IDENTITY="<identity from: security find-identity -v -p codesigning>"
-(cd src-tauri && cargo test --lib)     # 161 tests; build.rs fails closed without the identity
-npm test && npx tsc -b && npm run lint # 37 TS tests
+(cd src-tauri && cargo test --lib)     # 169 tests; build.rs fails closed without the identity
+npm test && npx tsc -b && npm run lint # 39 TS tests
 npm run test:signing                   # 45 signing tests
 npm run bundle:stable && npm run bundle:verify
 ```
@@ -72,7 +78,7 @@ with `MAIN` = the main checkout:
 ```bash
 npm install
 ln -s "$MAIN/assets/models"/*.bin assets/models/          # ~574 MB model, not in Git
-ln -s "$MAIN/vendor/whisper.cpp/build" vendor/whisper.cpp/build
+ln -s "$MAIN/vendor/whisper.cpp/build" vendor/whisper.cpp/build   # build.rs resolves the link (rpaths name the real path)
 cp "$MAIN/profile.yaml" . 2>/dev/null || true             # if the owner created one
 ```
 
@@ -90,16 +96,18 @@ cp "$MAIN/profile.yaml" . 2>/dev/null || true             # if the owner created
 - `voice_command.rs`: "Låt oss se" / "Let's see" detection.
 - `screen.rs` + Swift `screenshot` command in `native/macos/.../main.swift`.
 - `analysis.rs`: post-interview report and saving.
+- `history.rs`: SQLite history (`history.sqlite`), single writer thread, `PRAGMA user_version` schema.
 - `settings.rs`: `~/Library/Application Support/com.rafal.intervjuare/settings.json`.
 - `copilot.rs`: orchestration, trigger rules, Tauri commands, events
   (`suggestion-event`, `memory-event`, `voice-command`, `analysis-event`).
 
-UI (`src/`): `App.tsx` (audio setup + layout), `CopilotSetup.tsx`,
-`SuggestionPanel.tsx`, `AnalysisPanel.tsx`, `useCopilot.ts`,
+UI (`src/`): `App.tsx` (audio setup + layout, Interview/History tabs),
+`CopilotSetup.tsx`, `SuggestionPanel.tsx`, `AnalysisPanel.tsx`,
+`HistoryView.tsx`, `useCopilot.ts`,
 `suggestionView.ts` (pure, tested).
 
 Docs: `docs/model-runtime.md`, `docs/context-management.md`,
-`docs/screenshot.md`, `docs/post-interview.md`, `docs/profile-format.md`,
+`docs/screenshot.md`, `docs/post-interview.md`, `docs/history.md`, `docs/profile-format.md`,
 `docs/audio-pipeline.md`.
 
 ## Known issues and gotchas
@@ -116,17 +124,15 @@ Docs: `docs/model-runtime.md`, `docs/context-management.md`,
   vocabulary prompt built from profile ids/skills could help, but it touches
   the Milestone 1 STT path, which deliberately sends an empty prompt and
   `--no-context`. Measure before changing it.
-- The transcript and memory are in memory only; analysis after a restart is
-  impossible until history is persisted.
+- History stores final segments only, so a segment that never reached its
+  final (for example app killed mid-sentence) is not in history.
 
 ## Suggested next steps
 
 1. Owner checklist above, especially the Milestone 1 live test and the account
    choice.
-2. Interview history in SQLite (transcript, suggestions, memory, report) as an
-   explicit, local, opt-in feature.
-3. Rest of Milestone 6: follow-up prediction (prepare likely follow-ups while
+2. Rest of Milestone 6: follow-up prediction (prepare likely follow-ups while
    the candidate answers, off the critical path) and web search only when
    needed (never delaying anchors).
-4. Whisper vocabulary prompt from the profile (measure WER and latency first).
-5. Keyboard shortcuts for Force / Shorter / Other example / Capture screen.
+3. Whisper vocabulary prompt from the profile (measure WER and latency first).
+4. Keyboard shortcuts for Force / Shorter / Other example / Capture screen.

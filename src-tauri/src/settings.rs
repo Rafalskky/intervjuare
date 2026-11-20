@@ -33,6 +33,8 @@ pub struct Settings {
     pub report_language: String,
     /// Model for the post-interview report; empty means `model`.
     pub analysis_model: String,
+    /// Save interviews to the local history database (see docs/history.md).
+    pub history_enabled: bool,
 }
 
 impl Default for Settings {
@@ -48,6 +50,7 @@ impl Default for Settings {
             answer_mode: AnswerMode::Normal,
             report_language: "pl".to_string(),
             analysis_model: String::new(),
+            history_enabled: true,
         }
     }
 }
@@ -135,6 +138,7 @@ mod tests {
         assert_eq!(settings.screen_model(), "gpt-6-luna");
         assert_eq!(settings.analysis_model(), "gpt-6-luna");
         assert_eq!(settings.report_language, "pl");
+        assert!(settings.history_enabled, "history is on by default (local only, see docs/history.md)");
 
         let mut changed = settings.clone();
         changed.account_email = Some("me@example.com".into());

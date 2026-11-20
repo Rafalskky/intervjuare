@@ -29,8 +29,9 @@ marked "to verify".
 
 - It never edits `profile.yaml` (README: the user decides).
 - It never runs during the interview path.
-- Nothing is written to disk unless the owner presses **Save as Markdown**.
-  Reports then go to
+- With history on (default, see `docs/history.md`), a finished report is
+  stored with its interview in the local history database. **Save as
+  Markdown** additionally exports a file to
   `~/Library/Application Support/com.rafal.intervjuare/reports/interview-YYYY-MM-DD-HHMM-<company>.md`
   (UTC, owner-only `0600`, never overwritten).
 
@@ -42,8 +43,9 @@ the profile, ignored the recognition error "Sago Bo", and turned "Docker",
 mentioned in the interview but missing from the profile, into a suggestion
 marked "to verify".
 
-## Not yet
+## Saved interviews
 
-- Interview history (SQLite) to keep and compare past interviews.
-- Analysing an interview after the app was restarted. The transcript lives in
-  memory only.
+Interviews in **History** can be analysed (again) at any time, including after
+a restart. The report uses the stored transcript, memory, suggestions and job
+context together with the current `profile.yaml`, and replaces the stored
+report for that interview.
